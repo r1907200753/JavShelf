@@ -1,0 +1,8 @@
+node_modules/
+dist/
+release/
+out/
+*.log
+.DS_Store
+# 运行期生成的本地设置，不属于源码
+config.json

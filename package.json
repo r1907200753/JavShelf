@@ -1,0 +1,48 @@
+{
+  "name": "javshelf",
+  "version": "1.7.1",
+  "description": "JavShelf: 高分屏、本地多库、演员头像、流畅度优先的媒体库管理器",
+  "main": "main/main.js",
+  "private": true,
+  "author": "JavShelf",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke",
+    "dist": "node tools/build-portable.js",
+    "zip": "node tools/package-zip.js",
+    "icon": "electron tools/make-icon.js"
+  },
+  "devDependencies": {
+    "electron": "44.4.3",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "undici": "^8.10.2"
+  },
+  "build": {
+    "appId": "com.javshelf.library",
+    "productName": "JavShelf",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main/**/*",
+      "renderer/**/*",
+      "build/icon.png",
+      "preload.js",
+      "package.json"
+    ],
+    "asar": false,
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  }
+}

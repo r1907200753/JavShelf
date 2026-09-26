@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src shelfimg: blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src shelfimg: blob:;" />
+<title>JavShelf</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">Jav<span>Shelf</span></div>
+  <div class="search-wrap">
+    <input id="search" type="search" placeholder="搜索番号 / 片名 / 女优 / 类别…" autocomplete="off" spellcheck="false" aria-label="搜索番号、片名、女优或类别" />
+    <kbd>/</kbd>
+  </div>
+  <label class="field">排序
+    <select id="sortKey">
+      <option value="movie_日期">日期</option>
+      <option value="movie_编码">番号</option>
+      <option value="movie_评分">评分</option>
+      <option value="movie_片名">片名</option>
+      <option value="movie_时长">时长</option>
+      <option value="state_更新">最近更新</option>
+    </select>
+  </label>
+  <button id="sortDir" class="ghost" title="切换升/降序" aria-label="切换升序或降序">↓</button>
+  <label class="field">标题
+    <select id="titleField">
+      <option value="movie_编码">番号</option>
+      <option value="movie_片名">片名</option>
+    </select>
+  </label>
+  <label class="field">大小
+    <input id="cardWidth" type="range" min="140" max="340" step="10" value="190" />
+  </label>
+  <div class="spacer"></div>
+  <nav id="wallEntries">
+    <button data-wall="actress" class="ghost">女优</button>
+    <button data-wall="studio" class="ghost">片商</button>
+    <button data-wall="series" class="ghost">系列</button>
+  </nav>
+  <button id="btnLog" class="ghost">日志</button>
+  <button id="btnDisplay" class="ghost">显示设置</button>
+  <button id="btnAvatars" class="ghost">演员头像</button>
+  <button id="btnDupes" class="ghost">查重</button>
+  <button id="btnSettings" class="ghost">设置</button>
+</header>
+
+<div id="main">
+  <aside id="sidebar">
+    <div id="libPanel"></div>
+    <nav id="quickFilters">
+      <button data-quick="all" class="active">全部</button>
+      <button data-quick="fav">收藏</button>
+      <button data-quick="seen">已看</button>
+      <button data-quick="unseen">未看</button>
+      <button data-quick="sub">有字幕</button>
+    </nav>
+    <div class="tabs" id="facetTabs">
+      <button data-tab="actor" class="active">演员</button>
+      <button data-tab="category">类别</button>
+      <button data-tab="series">系列</button>
+      <button data-tab="code">番号</button>
+      <button data-tab="year">年代</button>
+    </div>
+    <div id="actorSort" class="actor-sort hidden"></div>
+    <div class="facet-search"><input id="facetSearch" placeholder="筛选列表…" spellcheck="false" aria-label="筛选侧栏列表" /></div>
+    <div id="facetList" class="scroll-y"></div>
+  </aside>
+
+  <section id="content">
+    <div id="activeFilters"></div>
+    <div id="subbar">
+      <label class="switch"><input id="waterfall" type="checkbox" /><span>瀑布流</span></label>
+      <span class="count" id="stCount">—</span>
+      <div class="pager" id="pager"></div>
+      <label class="field"><span id="pageSizeLabel">每页</span>
+        <select id="pageSize">
+          <option value="60">60</option>
+          <option value="120" selected>120</option>
+          <option value="240">240</option>
+          <option value="480">480</option>
+        </select>
+      </label>
+    </div>
+    <div id="gridHost" class="scroll-y"><div id="gridItems"></div></div>
+    <div id="emptyState" class="empty hidden"></div>
+    <div id="secondary" class="scroll-y hidden"></div>
+  </section>
+
+  <aside id="detail" class="hidden"></aside>
+</div>
+
+<footer id="statusbar">
+  <span id="stCount2">—</span>
+  <span class="dot"></span>
+  <span id="stScan">未索引</span>
+  <span class="dot"></span>
+  <span id="stAvatars">头像 —</span>
+  <span class="dot"></span>
+  <span id="stDpi">DPR —</span>
+  <span class="dot"></span>
+  <div class="spacer"></div>
+  <span id="stMsg"></span>
+</footer>
+
+<div id="jobPanel" class="hidden"></div>
+<div id="lightbox" class="hidden"></div>
+<div id="modalHost" class="hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
