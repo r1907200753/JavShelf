@@ -68,6 +68,42 @@ class Db {
     }
   }
 
+  // 番号 is not unique: the same title may be stored under two folders. A write that must
+  // change one specific record addresses it by the shelf table's real primary key.
+  loadRowByKey(onlyCode) {
+    const db = this.openRead();
+    try {
+      const r = db.prepare(`SELECT * FROM ${Db.quoteIdent(this.table)} WHERE "only_code" = ?`).get(String(onlyCode));
+      return r || null;
+    } finally {
+      db.close();
+    }
+  }
+
+  // Rewrite one shelf row's metadata after its nfo was edited. Identity columns stay put:
+  // moving them would orphan the row from the folder and from every other reader.
+  refreshMeta(onlyCode, values, updatedAt) {
+    const db = this.openWrite();
+    try {
+      const have = new Set(Db.columnNames(db, this.table));
+      const cols = Object.keys(values || {}).filter(
+        (c) => have.has(c) && c !== 'only_code' && c !== 'movie_编码' && c !== 'file_路径'
+      );
+      if (!cols.length) return 0;
+      const sets = cols.map((c) => `${Db.quoteIdent(c)} = ?`);
+      const args = cols.map((c) => values[c]);
+      if (updatedAt !== undefined && have.has('state_更新')) {
+        sets.push(`${Db.quoteIdent('state_更新')} = ?`);
+        args.push(updatedAt);
+      }
+      return db
+        .prepare(`UPDATE ${Db.quoteIdent(this.table)} SET ${sets.join(', ')} WHERE "only_code" = ?`)
+        .run(...args, String(onlyCode)).changes;
+    } finally {
+      db.close();
+    }
+  }
+
   // file_路径 is deliberately left out of the grid query, so the handful of rows that
   // need a disk lookup ask for it in one batch instead.
   fileMeta(codes) {

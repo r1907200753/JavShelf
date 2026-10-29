@@ -1,6 +1,6 @@
 {
   "name": "javshelf",
-  "version": "1.7.1",
+  "version": "2.0.1",
   "description": "JavShelf: 高分屏、本地多库、演员头像、流畅度优先的媒体库管理器",
   "main": "main/main.js",
   "private": true,
@@ -8,10 +8,8 @@
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "smoke": "electron . --smoke",
-    "dist": "node tools/build-portable.js",
-    "zip": "node tools/package-zip.js",
-    "icon": "electron tools/make-icon.js"
+    "dist": "electron-builder --win dir --x64",
+    "zip": "electron-builder --win zip --x64"
   },
   "devDependencies": {
     "electron": "44.4.3",
@@ -23,26 +21,25 @@
   "build": {
     "appId": "com.javshelf.library",
     "productName": "JavShelf",
+    "artifactName": "JavShelf-v${version}-windows-x86_64.${ext}",
+    "electronDist": "node_modules/electron/dist",
     "directories": {
       "output": "release"
     },
     "files": [
-      "main/**/*",
+      "main/**/*.js",
       "renderer/**/*",
+      "extension/**/*",
       "build/icon.png",
+      "build/icon.ico",
       "preload.js",
-      "package.json"
+      "package.json",
+      "LICENSE"
     ],
     "asar": false,
     "win": {
-      "target": [
-        {
-          "target": "dir",
-          "arch": [
-            "x64"
-          ]
-        }
-      ]
+      "icon": "build/icon.ico",
+      "target": [{ "target": "dir", "arch": ["x64"] }]
     }
   }
 }

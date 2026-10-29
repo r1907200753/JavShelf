@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="380" viewBox="0 0 1280 380" role="img" aria-labelledby="title desc">
+  <title id="title">JavShelf — 让本地收藏，井然有序。</title>
+  <desc id="desc">Orbit 2.0.1，Windows 本地媒体库管理器。深色背景、珊瑚色书架与薄荷绿轨道。</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#191d20"/><stop offset="1" stop-color="#101416"/></linearGradient>
+    <linearGradient id="shelf" x2="1" y2="1"><stop stop-color="#ffc49b"/><stop offset="1" stop-color="#ed8568"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#89c9ae" stop-opacity=".15"/><stop offset="1" stop-color="#89c9ae" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="1280" height="380" rx="24" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1278" height="378" rx="23" fill="none" stroke="#343b3b"/>
+  <circle cx="1050" cy="190" r="280" fill="url(#glow)"/>
+  <g fill="none" stroke="#8dc6ad" stroke-opacity=".13">
+    <ellipse cx="1035" cy="188" rx="255" ry="114" transform="rotate(-28 1035 188)"/>
+    <ellipse cx="1035" cy="188" rx="196" ry="196"/>
+    <ellipse cx="1035" cy="188" rx="146" ry="146"/>
+  </g>
+  <circle cx="1208" cy="89" r="6" fill="#9cd6b8"/>
+  <circle cx="866" cy="269" r="4" fill="#ed9b7e"/>
+  <g font-family="Segoe UI, Microsoft YaHei, sans-serif">
+    <rect x="60" y="49" width="156" height="29" rx="14.5" fill="#28372f"/>
+    <circle cx="77" cy="63.5" r="3.5" fill="#a2d6b7"/>
+    <text x="90" y="68" fill="#b7ddc5" font-size="11" letter-spacing="2">ORBIT / v2.0.1</text>
+    <text x="57" y="159" fill="#f2eee6" font-size="73" font-weight="650" letter-spacing="-3">JavShelf</text>
+    <text x="62" y="216" fill="#ede7dc" font-size="29" font-weight="500" letter-spacing="2">让本地收藏，井然有序。</text>
+    <text x="62" y="253" fill="#a1aaa8" font-size="16">海报墙 · 多库管理 · 一键播放 · 本地优先</text>
+    <g font-size="11" letter-spacing="1.5" fill="#a8b6b0">
+      <text x="62" y="326">WINDOWS x64</text>
+      <circle cx="192" cy="322" r="2" fill="#536259"/>
+      <text x="210" y="326">LOCAL FIRST</text>
+      <circle cx="337" cy="322" r="2" fill="#536259"/>
+      <text x="355" y="326">MIT LICENSE</text>
+    </g>
+  </g>
+  <g transform="translate(955 107)">
+    <rect x="0" y="4" width="34" height="130" rx="8" fill="#e9ddc4"/>
+    <path d="M0 40h34M0 54h34" stroke="#19211e" stroke-width="6"/>
+    <rect x="47" y="-7" width="36" height="141" rx="8" fill="url(#shelf)"/>
+    <path d="M47 31h36" stroke="#fbe8ce" stroke-width="8"/>
+    <g transform="rotate(-13 115 129)">
+      <rect x="95" y="12" width="34" height="122" rx="8" fill="#e9ddc4"/>
+      <path d="M95 47h34" stroke="#19211e" stroke-width="7"/>
+    </g>
+    <rect x="-18" y="139" width="176" height="12" rx="6" fill="#e9ddc4"/>
+    <circle cx="138" cy="149" r="36" fill="#96cfae" stroke="#18211e" stroke-width="7"/>
+    <path d="m132 136 19 13-19 13z" fill="#18211e" stroke="#18211e" stroke-linejoin="round" stroke-width="3"/>
+  </g>
+</svg>

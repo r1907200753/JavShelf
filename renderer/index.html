@@ -2,113 +2,123 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'self'; img-src shelfimg: blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src shelfimg: blob:;" />
 <title>JavShelf</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-<header id="topbar">
-  <div class="brand">Jav<span>Shelf</span></div>
-  <div class="search-wrap">
-    <input id="search" type="search" placeholder="搜索番号 / 片名 / 女优 / 类别…" autocomplete="off" spellcheck="false" aria-label="搜索番号、片名、女优或类别" />
-    <kbd>/</kbd>
-  </div>
-  <label class="field">排序
-    <select id="sortKey">
-      <option value="movie_日期">日期</option>
-      <option value="movie_编码">番号</option>
-      <option value="movie_评分">评分</option>
-      <option value="movie_片名">片名</option>
-      <option value="movie_时长">时长</option>
-      <option value="state_更新">最近更新</option>
-    </select>
-  </label>
-  <button id="sortDir" class="ghost" title="切换升/降序" aria-label="切换升序或降序">↓</button>
-  <label class="field">标题
-    <select id="titleField">
-      <option value="movie_编码">番号</option>
-      <option value="movie_片名">片名</option>
-    </select>
-  </label>
-  <label class="field">大小
-    <input id="cardWidth" type="range" min="140" max="340" step="10" value="190" />
-  </label>
-  <div class="spacer"></div>
-  <nav id="wallEntries">
-    <button data-wall="actress" class="ghost">女优</button>
-    <button data-wall="studio" class="ghost">片商</button>
-    <button data-wall="series" class="ghost">系列</button>
-  </nav>
-  <button id="btnLog" class="ghost">日志</button>
-  <button id="btnDisplay" class="ghost">显示设置</button>
-  <button id="btnAvatars" class="ghost">演员头像</button>
-  <button id="btnDupes" class="ghost">查重</button>
-  <button id="btnSettings" class="ghost">设置</button>
-</header>
-
-<div id="main">
-  <aside id="sidebar">
-    <div id="libPanel"></div>
-    <nav id="quickFilters">
-      <button data-quick="all" class="active">全部</button>
-      <button data-quick="fav">收藏</button>
-      <button data-quick="seen">已看</button>
-      <button data-quick="unseen">未看</button>
-      <button data-quick="sub">有字幕</button>
+<div id="appShell">
+  <aside id="sidebar" aria-label="分区导航">
+    <div class="rail-brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 30" focusable="false"><g fill="currentColor" stroke="none"><rect x="3" y="7.4" width="4.6" height="12.9" rx="1.6"/><rect x="9" y="4.6" width="5" height="15.7" rx="1.7" opacity=".72"/><rect x="15.3" y="8.7" width="4.5" height="11.6" rx="1.5" opacity=".86"/><rect x="2.2" y="20.3" width="18.2" height="2.2" rx="1.1"/><rect x="4.4" y="24.8" width="12.4" height="2" rx="1" opacity=".55"/></g><path d="M20.8 16.8 26 20.3l-5.2 3.5z" fill="currentColor" stroke="none"/></svg></span><div class="brand">Jav<span>Shelf</span></div></div>
+    <div class="rail-label">私人媒体库</div>
+    <nav class="rail-nav" aria-label="个人收藏">
+      <button id="navHome" class="rail-link on" aria-current="page"><span class="nav-symbol" aria-hidden="true">▦</span><span>全部影片</span><b id="navTotal">0</b></button>
+      <button id="navFavorites" class="rail-link"><span class="nav-symbol" aria-hidden="true">♡</span><span>我的收藏</span><b id="navFavCount">0</b></button>
     </nav>
-    <div class="tabs" id="facetTabs">
-      <button data-tab="actor" class="active">演员</button>
-      <button data-tab="category">类别</button>
-      <button data-tab="series">系列</button>
-      <button data-tab="code">番号</button>
-      <button data-tab="year">年代</button>
+    <div class="rail-label">探索目录</div>
+    <nav id="wallEntries" class="rail-nav" aria-label="探索目录">
+      <button data-wall="actress" class="rail-link"><span class="nav-symbol" aria-hidden="true">♙</span><span>演员</span></button>
+      <button data-wall="studio" class="rail-link"><span class="nav-symbol" aria-hidden="true">▤</span><span>片商</span></button>
+      <button data-wall="series" class="rail-link"><span class="nav-symbol" aria-hidden="true">▱</span><span>系列</span></button>
+    </nav>
+    <div id="libPanel"></div>
+    <div class="rail-bottom">
+      <button id="btnManage" class="rail-link"><span class="nav-symbol" aria-hidden="true">⌘</span><span>管理中心</span></button>
+      <button id="btnSettings" class="rail-link"><span class="nav-symbol" aria-hidden="true">⚙</span><span>偏好设置</span></button>
     </div>
-    <div id="actorSort" class="actor-sort hidden"></div>
-    <div class="facet-search"><input id="facetSearch" placeholder="筛选列表…" spellcheck="false" aria-label="筛选侧栏列表" /></div>
-    <div id="facetList" class="scroll-y"></div>
   </aside>
 
-  <section id="content">
-    <div id="activeFilters"></div>
-    <div id="subbar">
-      <label class="switch"><input id="waterfall" type="checkbox" /><span>瀑布流</span></label>
-      <span class="count" id="stCount">—</span>
-      <div class="pager" id="pager"></div>
-      <label class="field"><span id="pageSizeLabel">每页</span>
-        <select id="pageSize">
-          <option value="60">60</option>
-          <option value="120" selected>120</option>
-          <option value="240">240</option>
-          <option value="480">480</option>
-        </select>
-      </label>
+  <div id="workspace">
+    <header id="topbar">
+      <div class="breadcrumb"><span>私人媒体库</span><i>/</i><b id="workspaceCrumb">全部影片</b></div>
+      <div class="spacer"></div>
+      <div class="search-wrap">
+        <input id="search" type="search" placeholder="搜索番号、片名、演员、类别…" autocomplete="off" spellcheck="false" aria-label="搜索番号、片名、女优或类别" />
+        <button id="searchActor" class="search-actor hidden" type="button" title="进入演员目录"></button>
+        <kbd>/</kbd>
+      </div>
+      <button id="btnDisplay" class="ghost toolbar-icon" title="显示设置" aria-label="显示设置">☷</button>
+      <button id="btnLog" class="ghost toolbar-icon" title="日志" aria-label="日志">≋</button>
+    </header>
+
+    <div id="main">
+      <aside id="filterPanel" class="hidden" aria-label="高级筛选">
+        <div class="filter-heading"><b>细分收藏</b><button id="closeFilters" class="ghost" aria-label="关闭筛选">×</button></div>
+        <div class="tabs" id="facetTabs">
+          <button data-tab="actor" class="active">演员</button>
+          <button data-tab="category">类别</button>
+          <button data-tab="series">系列</button>
+          <button data-tab="code">番号</button>
+          <button data-tab="year">年代</button>
+        </div>
+        <div id="actorSort" class="actor-sort hidden"></div>
+        <div class="facet-search"><input id="facetSearch" placeholder="筛选列表…" spellcheck="false" aria-label="筛选侧栏列表" /></div>
+        <div id="facetList" class="scroll-y"></div>
+      </aside>
+
+      <section id="content" aria-label="媒体库内容">
+        <div id="libraryIntro">
+          <div class="library-strip">
+            <div class="strip-title">
+              <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 30" focusable="false"><g fill="currentColor" stroke="none"><rect x="3" y="7.4" width="4.6" height="12.9" rx="1.6"/><rect x="9" y="4.6" width="5" height="15.7" rx="1.7" opacity=".72"/><rect x="15.3" y="8.7" width="4.5" height="11.6" rx="1.5" opacity=".86"/><rect x="2.2" y="20.3" width="18.2" height="2.2" rx="1.1"/><rect x="4.4" y="24.8" width="12.4" height="2" rx="1" opacity=".55"/></g><path d="M20.8 16.8 26 20.3l-5.2 3.5z" fill="currentColor" stroke="none"/></svg></span>
+              <h1 id="workspaceTitle">我的媒体库</h1>
+            </div>
+            <div class="strip-stats" aria-label="媒体库统计">
+              <div class="stat"><button id="metricTotal" class="stat-num" data-stat="all" title="显示全部影片" aria-label="显示全部影片">0</button><span>部影片</span></div>
+              <div class="stat"><button id="metricFavorites" class="stat-num" data-stat="fav" title="只看收藏" aria-label="只看收藏">0</button><span>收藏</span></div>
+              <div class="stat"><button id="metricUnseen" class="stat-num" data-stat="unseen" title="只看未看" aria-label="只看未看">0</button><span>未看</span></div>
+            </div>
+            <div class="spacer"></div>
+            <button id="btnLibraries" class="ghost strip-manage">管理媒体库 <span aria-hidden="true">↗</span></button>
+          </div>
+        </div>
+        <div id="browseTools">
+          <nav id="quickFilters" aria-label="快速筛选">
+            <button data-quick="all" class="active">全部</button>
+            <button data-quick="fav">收藏</button>
+            <button data-quick="seen">已看</button>
+            <button data-quick="unseen">未看</button>
+            <button data-quick="sub">有字幕</button>
+          </nav>
+          <button id="btnFilters" class="ghost" aria-controls="filterPanel" aria-expanded="false">筛选</button>
+          <div class="spacer"></div>
+          <label class="field">排序 <select id="sortKey"><option value="movie_日期">日期</option><option value="movie_编码">番号</option><option value="movie_评分">评分</option><option value="movie_片名">片名</option><option value="movie_时长">时长</option><option value="state_更新">最近更新</option></select></label>
+          <button id="sortDir" class="ghost" title="切换升/降序" aria-label="切换升序或降序">↓</button>
+          <label class="field">标题 <select id="titleField"><option value="movie_编码">番号</option><option value="movie_片名">片名</option></select></label>
+          <label class="field density-field" title="海报密度：自动按窗口排列，或固定 1–8 列">密度 <input id="density" type="range" min="0" max="8" step="1" value="0" aria-label="海报密度（列数，0 为自动）" /><b id="densityNum">自动</b></label>
+          <label class="field size-field">大小 <input id="cardWidth" type="range" min="140" max="340" step="10" value="190" aria-label="海报大小" /></label>
+        </div>
+        <div id="activeFilters"></div>
+        <div id="subbar">
+          <label class="switch"><input id="waterfall" type="checkbox" /><span>瀑布流</span></label>
+          <span class="count" id="stCount">—</span>
+          <div class="pager" id="pager"></div>
+          <label class="field"><span id="pageSizeLabel">每页</span><select id="pageSize"><option value="60">60</option><option value="120" selected>120</option><option value="240">240</option><option value="480">480</option></select></label>
+        </div>
+        <div id="gridHost" class="scroll-y"><div id="gridItems"></div></div>
+        <div id="emptyState" class="empty hidden"></div>
+        <div id="secondary" class="scroll-y hidden"></div>
+      </section>
+      <aside id="inspector" class="drawer hidden" role="dialog" aria-label="影片详情" tabindex="-1">
+        <div class="drawer-grip" title="拖动调整宽度，双击复位" aria-hidden="true"></div>
+        <div class="drawer-hero"></div>
+        <div class="drawer-toolbar"></div>
+        <div class="drawer-body scroll-y"></div>
+      </aside>
     </div>
-    <div id="gridHost" class="scroll-y"><div id="gridItems"></div></div>
-    <div id="emptyState" class="empty hidden"></div>
-    <div id="secondary" class="scroll-y hidden"></div>
-  </section>
 
-  <aside id="detail" class="hidden"></aside>
+    <footer id="statusbar">
+      <span class="status-live" aria-hidden="true"></span><span id="stCount2">—</span><span class="dot"></span><span id="stScan">未索引</span><span class="dot"></span><span id="stAvatars">头像 —</span><span class="dot"></span><span id="stDpi">DPR —</span><div class="spacer"></div><span id="stMsg" role="status"></span>
+    </footer>
+  </div>
 </div>
-
-<footer id="statusbar">
-  <span id="stCount2">—</span>
-  <span class="dot"></span>
-  <span id="stScan">未索引</span>
-  <span class="dot"></span>
-  <span id="stAvatars">头像 —</span>
-  <span class="dot"></span>
-  <span id="stDpi">DPR —</span>
-  <span class="dot"></span>
-  <div class="spacer"></div>
-  <span id="stMsg"></span>
-</footer>
-
+<div id="detailBackdrop" class="hidden"></div>
+<aside id="detail" class="hidden" role="dialog" aria-modal="true" aria-label="完整详情" tabindex="-1"></aside>
 <div id="jobPanel" class="hidden"></div>
 <div id="lightbox" class="hidden"></div>
 <div id="modalHost" class="hidden"></div>
-
 <script src="app.js"></script>
 </body>
 </html>

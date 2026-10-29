@@ -31,10 +31,11 @@ const api = {
   onIngestProgress: (cb) => ipcRenderer.on('ingest:progress', (_e, p) => cb(p)),
   onIngestDone: (cb) => ipcRenderer.on('ingest:done', (_e, p) => cb(p)),
 
-  resolve: (codes) => ipcRenderer.invoke('media:resolve', codes),
+  resolve: (codes, fast) => ipcRenderer.invoke('media:resolve', codes, !!fast),
+  onMediaResolved: (cb) => ipcRenderer.on('media:resolved', (_e, m) => cb(m)),
   pickDir: () => ipcRenderer.invoke('media:pickDir'),
   nfoRead: (rel) => ipcRenderer.invoke('nfo:read', rel),
-  nfoWrite: (rel, patch) => ipcRenderer.invoke('nfo:write', { rel, fields: patch.fields, actors: patch.actors }),
+  nfoWrite: (rel, patch) => ipcRenderer.invoke('nfo:write', { rel, fields: patch.fields, actors: patch.actors, code: patch.code, lib: patch.lib, onlyCode: patch.onlyCode }),
   nfoPath: (code) => ipcRenderer.invoke('nfo:path', code),
 
   idolList: () => ipcRenderer.invoke('idol:list'),
@@ -81,7 +82,19 @@ const api = {
   play: (code, lib) => ipcRenderer.invoke('player:open', { code, lib }),
   reveal: (p) => ipcRenderer.invoke('reveal:file', p),
 
-  imgUrl: (rel) => 'shelfimg://local/' + rel
+  // 浏览器拓展的本地桥接：开关/端口走 saveSettings 的 bridge 组，这两个只管状态与打开拓展目录。
+  bridgeStatus: () => ipcRenderer.invoke('bridge:status'),
+  bridgeOpenExtension: () => ipcRenderer.invoke('bridge:openExtension'),
+
+  // rel 直接来自磁盘路径，里面可能有 # ? %：不逐段编码的话 # 之后整段变成片段、
+  // ? 变成查询串，协议层永远读不到真正的文件。头像的缓存版本号本来就带 ?v=，得留在末尾。
+  imgUrl: (rel) => {
+    const s = String(rel == null ? '' : rel);
+    const at = s.indexOf('?');
+    const path = at < 0 ? s : s.slice(0, at);
+    const query = at < 0 ? '' : s.slice(at);
+    return 'shelfimg://local/' + path.split('/').map(encodeURIComponent).join('/') + query;
+  }
 };
 
 contextBridge.exposeInMainWorld('shelf', api);

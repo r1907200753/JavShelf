@@ -43,6 +43,9 @@ function sidecar(names, dir, base, kind) {
 class MediaIndex {
   constructor(entries) {
     this.errors = [];
+    // How many folders this build could not read. Persisted so the next launch can
+    // paint from this index immediately and still know it has to walk again.
+    this.unreadable = 0;
     this.byName = new Map();
     this.byDir = new Map();
     for (const e of entries || []) {
@@ -154,16 +157,18 @@ class MediaIndex {
     return [...this.byDir.values()];
   }
 
-  save(file, sig) {
+  save(file, sig, unreadable) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ sig, built: Date.now(), entries: this.entries() }));
+    fs.writeFileSync(file, JSON.stringify({ sig, built: Date.now(), unreadable: Number(unreadable) || 0, entries: this.entries() }));
   }
 
   static load(file, sig) {
     try {
       const j = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (j.sig !== sig || !Array.isArray(j.entries)) return null;
-      return new MediaIndex(j.entries);
+      const index = new MediaIndex(j.entries);
+      index.unreadable = Number(j.unreadable) || 0;
+      return index;
     } catch {
       return null;
     }
@@ -175,16 +180,16 @@ class MediaIndex {
     try {
       const j = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (!Array.isArray(j.entries)) return null;
-      return new MediaIndex(j.entries);
+      const index = new MediaIndex(j.entries);
+      index.unreadable = Number(j.unreadable) || 0;
+      return index;
     } catch {
       return null;
     }
   }
 }
 
-// A cold scan of four roots took ~6 minutes here (the 115 cloud mount dominates), so
-// the index is cached per root and only stale roots are re-walked, in the background,
-// one at a time. The grid therefore has real image paths from the first paint.
+// Cache indexes per root and refresh stale roots sequentially in the background so slow scans do not delay the first paint.
 class LibraryFiles {
   constructor(cacheDir) {
     this.cacheDir = cacheDir;
@@ -201,6 +206,31 @@ class LibraryFiles {
 
   static rootSig(dir) {
     return MediaIndex.signature([dir]);
+  }
+
+  // 索引文件本来就在本地，启动时先同步装进内存：首屏解析要立刻知道海报在哪。
+  // 目录遍历仍交给下面的延迟扫描；读这几个 JSON 只要几十毫秒，比首屏逐条问云盘快得多。
+  // 网盘根目录可能比窗口晚几秒才可访问，所以这里不等 existsSync：签名读不到时用旧索引
+  // 顶上并标记 stale，等后台 prepare 到了再重扫。扫描中的 part 不能被旧缓存顶掉。
+  preload(dirs) {
+    for (const dir of [...new Set(dirs.filter(Boolean))]) {
+      const prev = this.parts.get(dir);
+      if (prev && prev.scanning) continue;
+      const sig = LibraryFiles.rootSig(dir);
+      const fresh = MediaIndex.load(this.cacheFile(dir), sig);
+      const index = fresh || MediaIndex.loadStale(this.cacheFile(dir));
+      if (!index) continue;
+      if (prev && prev.sig === sig && prev.index.size >= index.size) continue;
+      this.parts.set(dir, {
+        dir,
+        sig,
+        index,
+        // 签名过期只代表后台还要重扫；旧索引仍先把墙画出来。缺口同理不自动重扫。
+        stale: this.forced.has(path.resolve(dir)) || !fresh,
+        scanning: false,
+        unreadable: index.unreadable || 0
+      });
+    }
   }
 
   status() {
@@ -234,12 +264,19 @@ class LibraryFiles {
       // added three levels down does not touch the root's timestamp, so a signature test
       // alone can never notice it. The cached index still paints the wall meanwhile.
       const forced = this.forced.has(path.resolve(dir));
-      if (cached) this.parts.set(dir, { dir, sig, index: cached, stale: forced, scanning: false });
-      else {
+      if (cached) {
+        this.parts.set(dir, {
+          dir, sig, index: cached,
+          // 缺口仅作状态提示，避免不可读目录拖慢每次启动；重扫由根签名变化或用户手动触发。
+          stale: forced,
+          scanning: false,
+          unreadable: cached.unreadable || 0
+        });
+      } else {
         // 签名变了(往根目录里加了新片就会变)。旧索引先顶上,后台重扫完再换,
         // 海报墙不必等整棵网盘树走完才有图。
         const staleIdx = MediaIndex.loadStale(this.cacheFile(dir));
-        this.parts.set(dir, { dir, sig, index: staleIdx || new MediaIndex([]), stale: true, scanning: false });
+        this.parts.set(dir, { dir, sig, index: staleIdx || new MediaIndex([]), stale: true, scanning: false, unreadable: (staleIdx && staleIdx.unreadable) || 0 });
       }
     }
     // Only drop roots the caller says are no longer wanted. Each library prepares its own dirs,
@@ -265,12 +302,29 @@ class LibraryFiles {
         });
         part.sig = LibraryFiles.rootSig(dir);
         if (built.errors.length) {
-          // 有一段没读到：这份索引不能当完整的存盘。留在内存里(取条目多的那一份)继续出图,
-          // 但标记 stale 让下一次开机或「重新扫描」再试一遍,并把缺的部分说清楚。
+          // 有一段没读到：留在内存里(取条目多的那一份)继续出图。这份索引同样要落盘——
+          // 一次云盘抖动不该让整轮遍历作废，否则索引永远停在旧版本，每次启动都从旧索引
+          // 开始、再走同步回退。缺口会落盘，但下次启动不会因此自动重扫，只有根签名变化
+          // 或用户点「重新扫描」才重走。
           if (built.size > part.index.size) part.index = built;
           part.stale = true;
           part.unreadable = built.errors.length;
-          warn(`${dir} 有 ${built.errors.length} 个目录没读到（${built.errors[0].error}），索引保持待重扫`);
+          warn(`${dir} 有 ${built.errors.length} 个目录没读到（${built.errors[0].error}），索引已落盘并保持待重扫`);
+          try {
+            part.sig = LibraryFiles.rootSig(dir);
+            part.index.save(this.cacheFile(dir), part.sig, built.errors.length);
+          } catch (e) {
+            warn(`${dir} 索引落盘失败：${(e && e.message) || e}`);
+          }
+          // 读到的这一段也要预热：网盘上个别目录读不到是常态，若因此整棵根都不预热，
+          // 新海报就永远没有本地副本，每次出图都要现场读网盘。
+          if (opts.onIndexed) {
+            try {
+              await opts.onIndexed(dir, part.index);
+            } catch (e) {
+              warn(`${dir} 预热失败：${(e && e.message) || e}`);
+            }
+          }
           onProgress({ dir, phase: 'incomplete', scanned: part.index.size, found: part.index.size, unreadable: built.errors.length });
         } else {
           part.index = built;
@@ -335,14 +389,7 @@ function pickNfo(names, dir, key) {
   return hit ? path.join(dir, hit) : null;
 }
 
-function resolveDir(dir, base) {
-  if (!dir || !fs.existsSync(dir)) return null;
-  let names;
-  try {
-    names = new Map(fs.readdirSync(dir).map((n) => [n.toLowerCase(), n]));
-  } catch {
-    return null;
-  }
+function entryFromNames(dir, names, base) {
   const stem = String(base || '').replace(/\.[a-z0-9]+$/i, '');
   const videos = [...names.values()].filter((n) => VIDEO_EXT.has(path.extname(n).toLowerCase())).sort((a, b) => a.localeCompare(b, 'en'));
   const key = stem || path.basename(videos[0] || '');
@@ -359,4 +406,28 @@ function resolveDir(dir, base) {
   };
 }
 
-module.exports = { MediaIndex, LibraryFiles, resolveDir, VIDEO_EXT };
+function resolveDir(dir, base) {
+  if (!dir || !fs.existsSync(dir)) return null;
+  let names;
+  try {
+    names = new Map(fs.readdirSync(dir).map((n) => [n.toLowerCase(), n]));
+  } catch {
+    return null;
+  }
+  return entryFromNames(dir, names, base);
+}
+
+// 索引外条目在云盘上解析时走这条：同样的目录内容，异步读，主进程不会被
+// 一次 200ms~1.4s 的 readdir 冻住（首屏 32 条就是约 6 秒的事件循环阻塞）。
+async function resolveDirAsync(dir, base) {
+  if (!dir) return null;
+  let items;
+  try {
+    items = await fsp.readdir(dir);
+  } catch {
+    return null;
+  }
+  return entryFromNames(dir, new Map(items.map((n) => [n.toLowerCase(), n])), base);
+}
+
+module.exports = { MediaIndex, LibraryFiles, resolveDir, resolveDirAsync, VIDEO_EXT };

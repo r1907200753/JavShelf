@@ -88,25 +88,53 @@ function save(dbFile, idol) {
   }
 }
 
+// A name that is already carried as somebody's alias points at the profile that survived
+// that earlier merge, so folding into it again lands on the living row instead of
+// resurrecting a dead spelling as a fresh empty profile.
+function resolveName(db, name) {
+  if (db.prepare('SELECT 1 FROM idol WHERE name = ?').get(name)) return name;
+  const hit = db.prepare('SELECT name, aliases FROM idol').all().find((r) => parseAliases(r.aliases).includes(name));
+  return hit ? hit.name : name;
+}
+
 // Folding one profile into another: the source's name becomes an alias of the target so
-// rows written under either spelling still find the measurements.
+// rows written under either spelling still find the measurements, and every blank the
+// target never had gets filled from her rather than thrown away with the deleted row.
+const CARRIED = [...new Set([...FIELDS.slice(1), ...Object.keys(EXTRA)])];
+
 function merge(dbFile, from, into) {
   const a = String(from || '').trim();
-  const b = String(into || '').trim();
-  if (!a || !b) throw new Error('需要源名字和目标名字');
-  if (a === b) throw new Error('不能合并到自身');
+  const b0 = String(into || '').trim();
+  if (!a || !b0) throw new Error('需要源名字和目标名字');
   const db = open(dbFile);
   try {
-    const target = db.prepare('SELECT * FROM idol WHERE name = ?').get(b);
-    const aliases = new Set(target ? parseAliases(target.aliases) : []);
-    aliases.add(a);
+    const b = resolveName(db, b0);
+    // Either end can come back as the same person: the target may be a spelling the source
+    // already absorbed, or the source may itself be one of the target's aliases — in which
+    // case there is nothing to fold and saying so beats rewriting the row to what it was.
+    if (b === a || resolveName(db, a) === b) throw new Error('不能合并到自身');
+    const src = db.prepare('SELECT * FROM idol WHERE name = ?').get(a) || null;
+    const dst = db.prepare('SELECT * FROM idol WHERE name = ?').get(b) || null;
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
-    const row = target || { name: b, japanese_name: '', roman_name: '', chinese_name: '', height_cm: '', birth_date: '', bust: '', waist: '', hips: '', cup: '' };
-    db.prepare(`INSERT INTO idol (${FIELDS.join(',')}, aliases, updated) VALUES (${FIELDS.map(() => '?').join(',')}, ?, ?)
-       ON CONFLICT(name) DO UPDATE SET aliases=excluded.aliases, updated=excluded.updated`)
-      .run(...FIELDS.map((f) => String(row[f] || '')), JSON.stringify([...aliases]), now);
+    const row = { name: b };
+    const filled = [];
+    for (const f of CARRIED) {
+      const mine = String((dst && dst[f]) || '').trim();
+      const hers = String((src && src[f]) || '').trim();
+      if (mine) row[f] = mine;
+      else {
+        row[f] = hers;
+        if (hers) filled.push(f);
+      }
+    }
+    const aliases = new Set([...parseAliases(dst && dst.aliases), ...parseAliases(src && src.aliases), a]);
+    aliases.delete(b);
+    const cols = [...new Set([...FIELDS, ...CARRIED])];
+    db.prepare(`INSERT INTO idol (${cols.join(',')}, aliases, updated) VALUES (${cols.map(() => '?').join(',')}, ?, ?)
+       ON CONFLICT(name) DO UPDATE SET ${cols.filter((f) => f !== 'name').map((f) => `${f}=excluded.${f}`).join(',')}, aliases=excluded.aliases, updated=excluded.updated`)
+      .run(...cols.map((f) => (f === 'name' ? b : String(row[f] || ''))), JSON.stringify([...aliases]), now);
     db.prepare('DELETE FROM idol WHERE name = ?').run(a);
-    return { from: a, into: b, aliases: [...aliases] };
+    return { from: a, into: b, aliases: [...aliases], filled };
   } finally {
     db.close();
   }

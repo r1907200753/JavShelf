@@ -23,6 +23,8 @@ const state = {
   counts: new Map(),       // library name -> rows, for the sidebar
   idols: [],
   idolMap: new Map(),
+  actorAlias: new Map(),    // 别名 -> 档案名；只有显式别名参与折叠
+  actorFold: new Map(),     // 档案名 -> 它吸收掉的写法，头像按这个回退
   nav: [],
   entities: { studio: [], series: [] },
   actorSort: 'count',
@@ -118,9 +120,8 @@ async function boot() {
   state.rows = data.rows.map(derive);
   state.byCode = new Map(state.rows.map((r) => [r.movie_编码, r]));
   state.needsSetup = info.needsSetup || !state.rows.length;
-  await loadIdols();
-  await loadEntities();
-  await refreshAvatarStat();
+  // 先把墙画出来。演员资料和片商/系列只补侧栏与副页，不该挡首屏；两者并行去取，
+  // 回来后再刷新演员榜的别名合并计数，墙本身不用整面重渲染。
   buildFacets();
   wireUi();
   wireJobs();
@@ -133,6 +134,10 @@ async function boot() {
     setStatus(`${state.libraries.length} 个库 · ${state.rows.length} 条`, 5000);
   }
   autoIngest();
+  await Promise.all([loadIdols(), loadEntities()]);
+  buildFacets();
+  renderFacets();
+  refreshAvatarStat().catch(() => {});
   window.__booted = true;
   window.__bootInfo = info;
   window.__state = state;
@@ -144,6 +149,7 @@ async function boot() {
   window.__nav = { push: pushFrame, pop: popFrame, top: navTop, entries: entityEntries };
   window.__openSecondary = (type) => pushFrame({ kind: 'covers', type, page: 1 });
   window.__cropDialog = cropDialog;
+  window.__idolModal = idolModal;
   window.__resolveNow = resolveMedia;
   window.__dupes = { key: dupKey, groups: dupGroups };
 }
@@ -155,20 +161,47 @@ async function loadIdols() {
     state.idols = [];
   }
   state.idolMap = new Map();
+  state.actorAlias = new Map();
+  state.actorFold = new Map();
+  for (const p of state.idols) state.idolMap.set(p.name, p);
+  const own = new Set(state.idolMap.keys());
   for (const p of state.idols) {
-    state.idolMap.set(p.name, p);
-    for (const a of p.aliases || []) if (!state.idolMap.has(a)) state.idolMap.set(a, p);
+    for (const a of p.aliases || []) {
+      if (!a || a === p.name) continue;
+      if (!state.idolMap.has(a)) state.idolMap.set(a, p);
+      // A spelling that has a profile of its own is not an alias: folding it away would
+      // hide a real person's works behind somebody else's tile.
+      if (!own.has(a) && !state.actorAlias.has(a)) {
+        state.actorAlias.set(a, p.name);
+        if (!state.actorFold.has(p.name)) state.actorFold.set(p.name, []);
+        state.actorFold.get(p.name).push(a);
+      }
+    }
     if (p.japanese_name && !state.idolMap.has(p.japanese_name)) state.idolMap.set(p.japanese_name, p);
     if (p.chinese_name && !state.idolMap.has(p.chinese_name)) state.idolMap.set(p.chinese_name, p);
   }
 }
 
+// One tile per person. The wall, the sidebar list, the filters and the film list all count
+// by this, because a merge only ever records the dead spelling as an alias — the nfo files
+// on disk keep saying whatever they said, and rewriting those is not this program's call.
+const canonActor = (n) => state.actorAlias.get(n) || n;
+const spellingsOf = (name) => [name, ...(state.actorFold.get(name) || [])];
+
+const systemDark = matchMedia('(prefers-color-scheme: dark)');
+
 function applyAppearance() {
   const a = state.app;
   const root = document.documentElement.style;
   root.setProperty('--poster-radius', Math.max(0, Math.min(24, a.radius ?? 8)) + 'px');
-  document.body.classList.toggle('light', a.theme === 'light');
+  const auto = a.theme === 'auto';
+  const light = auto ? !systemDark.matches : a.theme === 'light';
+  document.body.classList.toggle('light', light);
 }
+
+systemDark.addEventListener('change', () => {
+  if (state.app.theme === 'auto') applyAppearance();
+});
 
 // The 显示设置 tab for the current surface decides grid columns, clamps and page size.
 function applyDisplay() {
@@ -186,6 +219,16 @@ function applyDisplay() {
   if (pl) pl.textContent = state.waterfall ? '每次加载' : '每页';
   paintPageSize();
   gridCols(d.perRow);
+  paintDensity();
+}
+
+function paintDensity() {
+  const slider = $('#density');
+  if (!slider) return;
+  const n = Number((state.disp.items || {}).perRow) || 0;
+  slider.value = n;
+  const label = $('#densityNum');
+  if (label) label.textContent = n ? n + ' 列' : '自动';
 }
 
 // 显示设置 accepts any 30-960, so the fixed topbar list may not contain the current value;
@@ -247,7 +290,7 @@ function applyFilters() {
 
   state.view = state.rows.filter((r) => {
     if (!matchQuick(r)) return false;
-    if (has('actor') && !anyIn('actor', r._acts)) return false;
+    if (has('actor') && !r._acts.some((n) => f.actor.has(canonActor(n)))) return false;
     if (has('category') && !anyIn('category', r._cats)) return false;
     if (has('studio') && !anyIn('studio', r._makers)) return false;
     if (has('series') && !anyIn('series', r._series)) return false;
@@ -300,6 +343,7 @@ function renderChips() {
 }
 
 function setQuick(q) {
+  closeDrawer({ focus: false });
   state.filters.quick = q;
   $$('#quickFilters button').forEach((b) => b.classList.toggle('active', b.dataset.quick === q));
   applyFilters();
@@ -329,7 +373,7 @@ function buildFacets() {
     return [...m];
   };
   facetData = {
-    actor: tally('actor', (r) => r._acts),
+    actor: tally('actor', (r) => [...new Set(r._acts.map(canonActor))]),
     category: tally('category', (r) => r._cats),
     studio: tally('studio', (r) => r._makers),
     series: tally('series', (r) => r._series),
@@ -337,6 +381,23 @@ function buildFacets() {
     year: tally('year', (r) => (r._year ? [r._year] : []))
   };
   facetData.year.sort((a, b) => b[0].localeCompare(a[0]));
+}
+
+// Search is a live film filter; a name typed exactly is also a door into that actress's
+// directory, which is where her filmography and profile actually live.
+function actorJumpName(query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return '';
+  const hit = (facetData.actor || []).find(([name]) => String(name).toLowerCase() === q);
+  return hit ? hit[0] : '';
+}
+
+function jumpToActor(name) {
+  if (!name) return false;
+  $('#searchActor').classList.add('hidden');
+  setFiltersOpen(false);
+  pushFrame({ kind: 'entity', type: 'actress', name, page: 1 });
+  return true;
 }
 
 const ACTOR_SORTS = [
@@ -507,16 +568,19 @@ function renderActorSort() {
 const gridItems = () => $('#gridItems');
 
 function render() {
+  syncWorkspace();
   if (inSecondary()) {
     renderSecondary().catch((e) => setStatus('二级界面渲染失败：' + e.message, 6000));
     return;
   }
   $('#secondary').classList.add('hidden');
+  $('#subbar').classList.remove('hidden');
   $$('#wallEntries button').forEach((b) => b.classList.remove('on'));
   const items = gridItems();
   const host = $('#gridHost');
   const empty = $('#emptyState');
   items.textContent = '';
+  empty.textContent = '';
   empty.classList.add('hidden');
   host.classList.remove('hidden');
 
@@ -630,20 +694,23 @@ function makeCard(r) {
   poster.append(img);
   const [top, bottom] = cardLines(r, d);
   card.append(poster, el('div', 'title', top), el('div', 'sub', bottom));
-  card.onclick = () => openDetail(code);
-  // 键盘也能开：一张卡片就是一个可聚焦的东西，否则只用 Tab 的人对着整面墙无能为力。
+  card.onclick = () => inspectCode(code);
+  card.ondblclick = (e) => {
+    if (!e.target.closest('button')) openDetail(code);
+  };
   card.tabIndex = 0;
   card.setAttribute('role', 'button');
   card.setAttribute('aria-label', code);
+  card.title = '单击快速检查 · 双击或 Enter 打开完整详情';
   card.onkeydown = (e) => {
-    if (e.key === 'Enter') {
+    if (e.key === 'Enter' && e.target === card) {
       e.preventDefault();
       openDetail(code);
     }
   };
   card.oncontextmenu = (e) => {
     e.preventDefault();
-    quickMenu(e, code);
+    quickMenu(code);
   };
   if (!d.hideActions) {
     const acts = el('div', 'actions');
@@ -705,10 +772,14 @@ function paintCardMedia(card, r) {
   const d = state.disp.items || {};
   const img = card.querySelector('.poster img');
   const thumbFirst = false;
-  const rel = (m && (thumbFirst ? m.thumb || m.poster : m.poster || m.thumb)) || posterRel(code);
-  if (img.dataset.src !== A.imgUrl(rel)) {
-    img.dataset.src = A.imgUrl(rel);
-    img.src = A.imgUrl(rel);
+  // 还没解析出媒体时先留空位：旧版 poster 路径在多数库上并不存在，提前请求只会让每张
+  // 卡片去云盘 stat 一次再 404，还抢走解析和缓存读取的线程。解析完 paintResolved 会再进来。
+  if (m !== undefined) {
+    const rel = (m && (thumbFirst ? m.thumb || m.poster : m.poster || m.thumb)) || posterRel(code);
+    if (img.dataset.src !== A.imgUrl(rel)) {
+      img.dataset.src = A.imgUrl(rel);
+      img.src = A.imgUrl(rel);
+    }
   }
   for (const t of card.querySelectorAll('.tag')) t.remove();
   const tag = (pos, text, cls) => {
@@ -756,20 +827,38 @@ async function playCode(code) {
 /* -------------------------------------------------------- media + avatars */
 
 const mediaCache = {};
+// 解析在途的编码：同一张卡片被多次渲染时不要重复发请求。
+const pendingMedia = new Set();
 
 async function resolveMedia(codes) {
+  const ask = codes.filter((c) => mediaCache[c] === undefined && !pendingMedia.has(c));
+  if (!ask.length) return;
+  for (const c of ask) pendingMedia.add(c);
   let found = {};
   try {
-    found = await A.resolve(codes);
+    // 快路径：索引命中立刻返回，索引外的慢行由主进程解析完通过 media:resolved 补发。
+    found = await A.resolve(ask, true);
   } catch {
+    for (const c of ask) pendingMedia.delete(c);
     return;
   }
-  for (const c of codes) mediaCache[c] = found[c] || null;
+  const hits = [];
+  for (const c of ask) {
+    if (!found[c]) continue;
+    mediaCache[c] = found[c];
+    pendingMedia.delete(c);
+    hits.push(c);
+  }
+  paintResolved(hits);
+}
+
+function paintResolved(codes) {
   for (const c of codes) {
     const card = $('#gridItems .card[data-code="' + cssEscape(c) + '"]') || $('#secondary .card[data-code="' + cssEscape(c) + '"]');
     const r = state.byCode.get(c);
     if (card && r) paintCardMedia(card, r);
   }
+  if (state.detailCode && codes.includes(state.detailCode)) refreshDrawer();
 }
 
 const cssEscape = (s) => String(s).replace(/["\\]/g, '\\$&');
@@ -811,7 +900,20 @@ async function resolveAvatars(names, done) {
     else renderFacets();
     return;
   }
-  for (const n of ask) avatarPaths[n] = found[n] || null;
+  for (const n of ask) {
+    let ref = found[n] || null;
+    if (!ref) {
+      // After a merge the wall asks under the surviving name while the picture may still
+      // sit under the spelling that was folded away — or the other way round on a card.
+      for (const alt of spellingsOf(canonActor(n))) {
+        if (found[alt]) {
+          ref = found[alt];
+          break;
+        }
+      }
+    }
+    avatarPaths[n] = ref;
+  }
   if (done) done();
   else renderFacets();
 }
@@ -834,7 +936,7 @@ async function refreshAvatars() {
   const cov = await refreshAvatarStat();
   renderFacets();
   render();
-  if (state.detailCode) await openDetail(state.detailCode);
+  if (state.detailCode && !$('#detail').classList.contains('hidden')) await openDetail(state.detailCode);
   return cov;
 }
 
@@ -1147,6 +1249,16 @@ const SECONDARY = {
   series: { label: '系列', field: 'movie_系列', entityKind: 'series' }
 };
 
+// Whose films these are. For 女优 a credit written under a merged-away spelling counts
+// for the surviving name too, so the tile's number and the list behind it always agree.
+function entityRows(type, name) {
+  const field = SECONDARY[type].field;
+  return state.rows.filter((r) => {
+    const names = SPLIT(clean(r[field])).map((s) => s.trim()).filter(Boolean);
+    return type === 'actress' ? names.some((n) => canonActor(n) === name) : names.includes(name);
+  });
+}
+
 function navTop() {
   return state.nav[state.nav.length - 1] || { kind: 'home' };
 }
@@ -1154,11 +1266,14 @@ function inSecondary() {
   return navTop().kind !== 'home';
 }
 function pushFrame(f) {
+  if (!$('#detail').classList.contains('hidden')) closeDetail();
+  closeDrawer({ focus: false });
   state.nav.push(f);
   render();
 }
 function popFrame() {
   if (!state.nav.length) return;
+  closeDrawer({ focus: false });
   state.nav.pop();
   render();
 }
@@ -1178,7 +1293,11 @@ function entityEntries(type) {
   if (!spec) return [];
   const byName = new Map();
   for (const r of state.rows) {
-    for (const name of SPLIT(clean(r[spec.field])).map((s) => s.trim()).filter(Boolean)) {
+    const names = SPLIT(clean(r[spec.field])).map((s) => s.trim()).filter(Boolean);
+    // One person, one tile: the merged-away spellings fold into the surviving name here,
+    // the same way the sidebar list already counts them.
+    const keys = type === 'actress' ? [...new Set(names.map(canonActor))] : names;
+    for (const name of keys) {
       const date = String(r.movie_日期 || '').trim();
       const code = String(r.movie_编码 || '');
       const cur = byName.get(name) || { name, count: 0, code: '', date: '', cands: [] };
@@ -1208,7 +1327,12 @@ function entityEntries(type) {
     if (type === 'actress') {
       const p = state.idolMap.get(e.name);
       if (p) {
-        e.cover = p.cover || e.cover || '';
+        if (p.cover) {
+          e.cover = p.cover;
+          e.coverIsAvatar = /^actor\//.test(p.cover);
+        } else {
+          e.cover = e.cover || '';
+        }
         e.javdbId = e.javdbId || p.javdb_id;
         e.javdbUrl = e.javdbUrl || p.javdb_url;
         e.profile = p;
@@ -1281,11 +1405,14 @@ function coverTile(type, e) {
   const tile = el('div', 'covtile');
   tile.dataset.name = e.name;
   const box = el('div', 'covimg');
-  const rel = e.cover || avatarPaths[e.name] || e.posterRel || '';
+  // 头像文件会被原地替换，同一路径必须有办法换 URL；mtime 标记由 actor:paths 按需给出，
+  // 还没拿到时用本次会话的 avatarGen 代打，别为了它去逐个 stat。
+  const rel = (e.coverIsAvatar ? avatarPaths[e.name] : '') || e.cover || avatarPaths[e.name] || e.posterRel || '';
   if (rel) {
     const img = el('img');
     img.loading = 'lazy';
-    img.src = A.imgUrl(rel);
+    const fresh = /^actor\//.test(rel) && !rel.includes('?v=') ? rel + '?g=' + avatarGen : rel;
+    img.src = A.imgUrl(fresh);
     // A dead sidecar used to leave the browser's broken-image glyph in the grid.
     img.onerror = () => {
       img.remove();
@@ -1356,13 +1483,12 @@ async function paintCovers(host, type) {
   for (const e of entries) grid.append(coverTile(type, e));
   host.append(grid);
   if (all.length > entries.length) host.append(el('p', 'hint', `只显示前 ${entries.length} 个，共 ${all.length} 个。用左侧列表继续缩小范围。`));
-  if (type === 'actress') resolveAvatars(entries.filter((e) => !e.cover).map((e) => e.name).slice(0, 400), () => render());
+  if (type === 'actress') resolveAvatars(entries.filter((e) => !e.cover || e.coverIsAvatar).map((e) => e.name).slice(0, 400), () => render());
 }
 
 async function paintEntityFilms(host, frame) {
-  const spec = SECONDARY[frame.type];
   // filter() gives us a fresh array, so sorting it in place cannot reorder state.rows.
-  const rows = sortRows(state.rows.filter((r) => SPLIT(clean(r[spec.field])).map((s) => s.trim()).includes(frame.name)));
+  const rows = sortRows(entityRows(frame.type, frame.name));
   const pages = Math.max(1, Math.ceil(rows.length / state.pageSize));
   if (frame.page > pages) frame.page = pages;
   const slice = rows.slice((frame.page - 1) * state.pageSize, frame.page * state.pageSize);
@@ -1413,7 +1539,7 @@ function navBar(type, frame) {
   }
   if (frame.kind === 'entity' && type === 'actress') {
     const prof = state.idolMap.get(frame.name);
-    const films = state.rows.filter((r) => SPLIT(clean(r[SECONDARY.actress.field])).map((s) => s.trim()).includes(frame.name)).length;
+    const films = entityRows('actress', frame.name).length;
     count.textContent = `${films} 部 · ` + (prof && prof.javdb_id ? `JavDB ${prof.javdb_id}` : '未绑定 JavDB');
     const bind = el('button', 'ghost', prof && prof.javdb_id ? '改绑 JavDB' : '绑定 JavDB');
     bind.title =
@@ -1640,11 +1766,25 @@ function wireJobs() {
     // state.cfg would keep showing the boot-time count of 0.
     if (p.phase === 'scan' && p.scanned % 200 < 24) repaintScan();
   });
-  A.onScanDone(() => {
+  A.onMediaResolved((map) => {
+    const codes = [];
+    for (const [c, entry] of Object.entries(map || {})) {
+      mediaCache[c] = entry || null;
+      pendingMedia.delete(c);
+      codes.push(c);
+    }
+    paintResolved(codes);
+  });
+  A.onScanDone((p) => {
     if (jobKind === 'warm') hideJob(400);
-    for (const k of Object.keys(mediaCache)) delete mediaCache[k];
+    // 只有墙上这个库的扫描会改变卡片指向。别的库扫完就清空整墙重解析，
+    // 三个本地库等于把首屏的慢目录重读三遍——它们和海报墙无关。
+    if (!p || !p.library || p.library === state.activeLib) {
+      for (const k of Object.keys(mediaCache)) delete mediaCache[k];
+      pendingMedia.clear();
+      render();
+    }
     repaintScan();
-    render();
   });
   A.onIngestProgress((p) => {
     jobKind = 'ingest';
@@ -1827,34 +1967,305 @@ function updateBar() {
 
 /* ------------------------------------------------------------------ detail */
 
-async function openDetail(code) {
-  const row = state.byCode.get(code);
+function syncWorkspace() {
+  const secondary = inSecondary();
+  const frame = navTop();
+  const favorites = state.rows.filter(r => r._fav).length;
+  $('#libraryIntro').classList.toggle('hidden', secondary);
+  $('#quickFilters').classList.toggle('hidden', secondary);
+  $('#workspaceCrumb').textContent = secondary ? (frame.name || SECONDARY[frame.type].label + '目录') : state.filters.quick === 'fav' ? '我的收藏' : '全部影片';
+  $('#workspaceTitle').textContent = state.filters.quick === 'fav' ? '我的收藏' : '我的媒体库';
+  $('#metricTotal').textContent = state.rows.length.toLocaleString();
+  $('#metricFavorites').textContent = favorites.toLocaleString();
+  $('#metricUnseen').textContent = state.rows.filter(r => !r._seen).length.toLocaleString();
+  for (const [id, on] of [
+    ['metricTotal', !secondary && state.filters.quick === 'all'],
+    ['metricFavorites', !secondary && state.filters.quick === 'fav'],
+    ['metricUnseen', !secondary && state.filters.quick === 'unseen']
+  ]) {
+    const b = $('#' + id);
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  }
+  $('#navTotal').textContent = state.rows.length.toLocaleString();
+  $('#navFavCount').textContent = favorites.toLocaleString();
+  for (const [id, on] of [['navHome', !secondary && state.filters.quick !== 'fav'], ['navFavorites', !secondary && state.filters.quick === 'fav']]) {
+    const b = $('#' + id);
+    b.classList.toggle('on', on);
+    if (on) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  }
+  $$('#wallEntries button').forEach(b => {
+    b.classList.toggle('on', secondary && b.dataset.wall === frame.type);
+    if (secondary && b.dataset.wall === frame.type) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
+  const count = ['actor', 'category', 'studio', 'series', 'year', 'code'].reduce((n, key) => n + state.filters[key].size, 0);
+  $('#btnFilters').textContent = count ? `筛选 · ${count}` : '筛选';
+  if (state.detailCode && !state.byCode.has(state.detailCode)) closeAllDetails();
+}
+
+function setFiltersOpen(open) {
+  if (open) closeDrawer({ focus: false });
+  $('#filterPanel').classList.toggle('hidden', !open);
+  $('#btnFilters').classList.toggle('on', open);
+  $('#btnFilters').setAttribute('aria-expanded', String(open));
+  if (!open && $('#filterPanel').contains(document.activeElement)) $('#btnFilters').focus();
+}
+
+function paintSelection() {
+  for (const c of $$('#gridItems .card, #secondary .card')) c.classList.toggle('sel', c.dataset.code === state.detailCode);
+}
+
+/* The right drawer is an overlay, not a column: the wall keeps its full width and the
+   drawer floats above it. It only exists after a poster is clicked. */
+const DRAWER_MIN = 360;
+const DRAWER_MAX = 560;
+const DRAWER_DEFAULT = 420;
+let drawerRequest = 0;
+
+function storedDrawerWidth() {
+  const n = Math.round(Number(localStorage.getItem('javshelf.drawerWidth')));
+  return Number.isFinite(n) && n > 0 ? Math.min(DRAWER_MAX, Math.max(DRAWER_MIN, n)) : DRAWER_DEFAULT;
+}
+
+function syncDrawerInset(width) {
+  const host = $('#inspector');
+  const open = host && !host.classList.contains('hidden');
+  document.documentElement.style.setProperty('--drawer-w', open ? (width || storedDrawerWidth()) + 'px' : '0px');
+}
+
+function setDrawerWidth(width, persist) {
+  const w = Math.min(DRAWER_MAX, Math.max(DRAWER_MIN, Math.round(width)));
+  const host = $('#inspector');
+  if (host) host.style.width = w + 'px';
+  syncDrawerInset(w);
+  if (persist) localStorage.setItem('javshelf.drawerWidth', String(w));
+  return w;
+}
+
+const drawerBody = () => $('#inspector .drawer-body');
+const drawerHero = () => $('#inspector .drawer-hero');
+const drawerToolbar = () => $('#inspector .drawer-toolbar');
+
+// What 上一部/下一部 walks: the whole filtered wall on the home page, and the cards
+// currently drawn on a secondary page (that page owns its own paging).
+function drawerSequence() {
+  if (inSecondary()) return $$('#secondary .card').map((c) => c.dataset.code).filter(Boolean);
+  return state.view.map((r) => String(r.movie_编码));
+}
+
+function inspectCode(code) {
+  if (!matchMedia('(min-width: 901px)').matches) return openDetail(code);
+  openDrawer(code);
+}
+
+async function openDrawer(code, opts = {}) {
+  if (!matchMedia('(min-width: 901px)').matches) return;
+  // 筛选 and the drawer compete for the same narrow strip; opening one closes the other.
+  if (!$('#filterPanel').classList.contains('hidden')) setFiltersOpen(false);
   state.detailCode = code;
-  const host = $('#detail');
+  paintSelection();
+  const host = $('#inspector');
+  const body = drawerBody();
+  const request = ++drawerRequest;
+  const held = host.contains(document.activeElement) ? document.activeElement.dataset.inspect : null;
+  const focusKey = opts.focusKey || held || null;
   host.classList.remove('hidden');
-  host.textContent = '';
-  host.append(el('div', 'body hint', '读取中…'));
-  for (const c of $$('#gridItems .card')) c.classList.toggle('sel', c.dataset.code === code);
-  const r = await A.row(code, row && row._lib);
-  host.textContent = '';
-  if (!r) {
-    host.append(el('div', 'body hint', '未找到记录'));
+  setDrawerWidth(storedDrawerWidth(), false);
+  drawerHero().textContent = '';
+  drawerToolbar().textContent = '';
+  body.textContent = '';
+  body.append(el('div', 'drawer-loading hint', '读取中…'));;
+  let r;
+  try {
+    r = await A.row(code, state.byCode.get(code) && state.byCode.get(code)._lib);
+  } catch (error) {
+    if (request === drawerRequest) body.textContent = '读取失败：' + error.message;
     return;
   }
+  if (request !== drawerRequest || state.detailCode !== code || host.classList.contains('hidden')) return;
+  if (!r) {
+    body.textContent = '未找到记录';
+    return;
+  }
+  paintDrawer(r, code, focusKey);
+  if (!focusKey && !opts.background) {
+    (host.querySelector('[data-inspect="full"]') || host.querySelector('.drawer-close') || host).focus();
+  }
+}
+
+function refreshDrawer() {
+  const code = state.detailCode;
+  if (!code || $('#inspector').classList.contains('hidden')) return;
+  openDrawer(code, { background: true });
+}
+
+function closeDrawer(opts = {}) {
+  const host = $('#inspector');
+  const code = state.detailCode;
+  if (host.classList.contains('hidden') && !code) return;
+  drawerRequest++;
+  host.classList.add('hidden');
+  syncDrawerInset(0);
+  const body = drawerBody();
+  if (body) body.textContent = '';
+  const hero = drawerHero();
+  if (hero) hero.textContent = '';
+  const toolbar = drawerToolbar();
+  if (toolbar) toolbar.textContent = '';
+  state.detailCode = null;
+  paintSelection();
+  if (opts.focus !== false) {
+    const card = $$('#secondary .card, #gridItems .card').find(c => c.dataset.code === code && c.offsetParent !== null);
+    (card || $('#navHome')).focus();
+  }
+}
+
+// ≤900px 下抽屉被 CSS 收起。如果只是视觉上藏着，把它放大回来会冒出一份过期的详情，
+// 所以跨过断点时就连同状态一起清掉；全屏详情打开时 detailCode 归它继续用。
+function retireDrawer() {
+  const host = $('#inspector');
+  if (host.classList.contains('hidden')) return;
+  const code = state.detailCode;
+  const hadFocus = host.contains(document.activeElement);
+  drawerRequest++;
+  host.classList.add('hidden');
+  syncDrawerInset(0);
+  drawerBody().textContent = '';
+  drawerHero().textContent = '';
+  drawerToolbar().textContent = '';
+  if ($('#detail').classList.contains('hidden')) {
+    state.detailCode = null;
+    paintSelection();
+    if (hadFocus) {
+      const card = $$('#secondary .card, #gridItems .card').find(c => c.dataset.code === code && c.offsetParent !== null);
+      (card || $('#navHome')).focus();
+    }
+  }
+}
+
+const wideViewport = matchMedia('(min-width: 901px)');
+wideViewport.addEventListener('change', (event) => {
+  if (!event.matches) retireDrawer();
+});
+
+function paintDrawer(r, code, focusKey) {
+  const host = $('#inspector');
+  const hero = drawerHero();
+  const body = drawerBody();
+  hero.textContent = '';
+  const toolbar = drawerToolbar();
+  toolbar.textContent = '';
+  body.textContent = '';
+
+  const m = r._media || mediaCache[code] || null;
+  if (m) mediaCache[code] = m;
+  const cover = el('div', 'drawer-cover');
+  const ambient = el('div', 'drawer-cover-ambient');
+  const image = el('img');
+  image.alt = code + ' 封面';
+  // The folder's wide fanart heads the drawer, as it did in 1.8.1; the poster is the
+  // fallback because a portrait crop would hide most of a landscape shot. The old
+  // per-code fanart cache is the last resort for rows the scanner could not resolve.
+  const picks = [];
+  if (m) {
+    if (m.fanart) picks.push({ rel: m.fanart, fanart: true });
+    if (m.poster) picks.push({ rel: m.poster });
+    if (m.thumb) picks.push({ rel: m.thumb });
+  } else {
+    picks.push({ rel: fanartRel(code), fanart: true }, { rel: posterRel(code) });
+  }
+  if (!picks.length) picks.push({ rel: posterRel(code) });
+  let at = 0;
+  const showCover = (pick) => {
+    cover.classList.toggle('is-fanart', !!pick.fanart);
+    hero.classList.toggle('is-fanart', !!pick.fanart);
+    const url = A.imgUrl(pick.rel);
+    image.src = url;
+    ambient.style.backgroundImage = 'url("' + url.replace(/"/g, '%22') + '")';
+  };
+  showCover(picks[at++]);
+  image.onerror = () => {
+    if (at < picks.length) return void showCover(picks[at++]);
+    cover.classList.remove('is-fanart');
+    hero.classList.remove('is-fanart');
+    image.remove();
+    ambient.remove();
+    cover.textContent = '暂无封面';
+  };
+  cover.append(ambient, image);
+  hero.append(cover);
+
+  const close = el('button', 'drawer-close', '×');
+  close.setAttribute('aria-label', '关闭影片详情');
+  close.title = '关闭影片详情';
+  close.onclick = () => closeDrawer();
+  hero.append(close);
+
+  // Controls live below the art, not on it: a bare close cross is all the fanart carries.
+  const seq = drawerSequence();
+  const slotAt = seq.indexOf(String(code));
+  if (slotAt >= 0 && seq.length > 1) {
+    const step = (key, target, glyph, label) => {
+      const b = el('button', 'ghost drawer-step ' + key, glyph);
+      b.dataset.inspect = key;
+      b.setAttribute('aria-label', label);
+      b.disabled = !target;
+      b.title = target
+        ? (key === 'prev' ? '上一部：' : '下一部：') + target
+        : key === 'prev' ? '已经是第一部' : '已经是最后一部';
+      if (target) b.onclick = () => openDrawer(target, { focusKey: key });
+      return b;
+    };
+    toolbar.append(
+      step('prev', seq[slotAt - 1], '‹', '上一部'),
+      el('span', 'drawer-pos', `${slotAt + 1} / ${seq.length}`),
+      step('next', seq[slotAt + 1], '›', '下一部')
+    );
+  }
+  const full = el('button', 'ghost primary drawer-full', '放大查看 ↗');
+  full.dataset.inspect = 'full';
+  full.title = '打开完整详情';
+  full.onclick = () => openDetail(code);
+  toolbar.append(el('span', 'drawer-spacer'), full);
+
+  const { node, needAvatar } = detailContent(r, code);
+  body.append(node);
+  if (needAvatar.length) {
+    resolveAvatars(needAvatar, () => {
+      if (state.detailCode === code && !$('#inspector').classList.contains('hidden')) refreshDrawer();
+    });
+  }
+  if (focusKey) {
+    let target = host.querySelector(`[data-inspect="${focusKey}"]`);
+    // Stepping onto the first/last film disables the button just used; move to its
+    // neighbour instead of dropping focus into a removed node.
+    if (!target || target.disabled) {
+      target =
+        host.querySelector(`[data-inspect="${focusKey === 'prev' ? 'next' : 'prev'}"]`) ||
+        host.querySelector('[data-inspect="full"]');
+    }
+    target?.focus();
+  }
+}
+
+let detailRequest = 0;
+let detailReturnFocus = null;
+
+function closeAllDetails() {
+  closeDetail();
+  closeDrawer({ focus: false });
+}
+
+// One builder for the overlay and the drawer: the two must never drift apart, and every
+// action that exists in one has to exist in the other.
+function detailContent(r, code) {
   const acts = SPLIT(r.movie_演员);
   const cats = SPLIT(r.movie_类别);
   const m = r._media || mediaCache[code] || null;
   if (m) mediaCache[code] = m;
   const stills = m ? [m.fanart, m.poster, m.thumb].filter(Boolean) : [];
-
-  const hero = el('div', 'hero');
-  const bg = el('img');
-  bg.src = A.imgUrl((m && (m.fanart || m.poster)) || fanartRel(code));
-  bg.onerror = () => bg.remove();
-  const close = el('button', 'ghost close', '×');
-  close.onclick = closeDetail;
-  hero.append(bg, close);
-
   const body = el('div', 'body');
   body.append(el('div', 'code-line', code));
   const filmName = clean(r.movie_片名 || '');
@@ -1876,28 +2287,29 @@ async function openDetail(code) {
       one.append(el('span', 'ph'));
     }
     one.append(el('span', null, a));
+    // The label keeps the nfo's own spelling; where it leads is the person she is now.
+    const who = canonActor(a);
     one.onclick = () => {
-      state.filters.actor = new Set([a]);
+      closeAllDetails();
+      state.nav = [];
+      state.filters.actor = new Set([who]);
       applyFilters();
     };
     one.oncontextmenu = (e) => {
       e.preventDefault();
-      idolModal(a);
+      idolModal(who);
     };
     one.title = '点击：在首页筛选她 · 右键：编辑女优资料';
-    // The pill itself keeps the home filter behaviour he asked to preserve; this is the
-    // separate route into the secondary page.
     const go = el('b', 'pillgo', '▸');
     go.title = '在二级界面查看她';
     go.onclick = (ev) => {
       ev.stopPropagation();
-      pushFrame({ kind: 'entity', type: 'actress', name: a, page: 1 });
+      pushFrame({ kind: 'entity', type: 'actress', name: who, page: 1 });
     };
     one.append(go);
     pillRow.append(one);
   }
   body.append(pillRow);
-  if (needAvatar.length) resolveAvatars(needAvatar, () => { if (state.detailCode === code) openDetail(code); });
 
   const kv = el('div', 'kv');
   const put = (k, v) => {
@@ -1927,6 +2339,8 @@ async function openDetail(code) {
   for (const c of cats.slice(0, 40)) {
     const p = el('span', 'pill', c);
     p.onclick = () => {
+      closeAllDetails();
+      state.nav = [];
       state.filters.category = new Set([c]);
       applyFilters();
     };
@@ -1935,22 +2349,24 @@ async function openDetail(code) {
   body.append(catRow);
 
   const actions = el('div', 'actions');
-  const btn = (label, fn, primary) => {
+  const btn = (label, fn, primary, key) => {
     const b = el('button', 'ghost' + (primary ? ' primary' : ''), label);
+    if (key) b.dataset.inspect = key;
     b.onclick = fn;
     actions.append(b);
     return b;
   };
-  btn('▶ 播放', () => playCode(code), true);
-  btn(truthy(r.state_收藏) ? '★ 取消收藏' : '☆ 收藏', () => toggleState(code, 'state_收藏'));
-  btn(truthy(r.state_已看) ? '标记未看' : '标记已看', () => toggleState(code, 'state_已看'));
+  btn('▶ 播放', () => playCode(code), true, 'play');
+  btn(truthy(r.state_收藏) ? '★ 取消收藏' : '☆ 收藏', () => toggleState(code, 'state_收藏'), false, 'fav').setAttribute('aria-pressed', String(truthy(r.state_收藏)));
+  btn(truthy(r.state_已看) ? '标记未看' : '标记已看', () => toggleState(code, 'state_已看'), false, 'seen').setAttribute('aria-pressed', String(truthy(r.state_已看)));
+  btn('更多操作', () => quickMenu(code), false, 'more');
   btn('打开目录', () => revealDir((m && m.dir) || '', '还没定位到这个条目所在的文件夹'));
   btn('复制路径', async () => {
     if (!m) return setStatus('还没定位到文件', 4000);
     navigator.clipboard.writeText(m.video || m.dir);
     setStatus('已复制文件路径', 2000);
   });
-  if (m && m.nfo) btn('编辑信息(nfo)', () => nfoModal(code, m.nfo));
+  if (m && m.nfo) btn('编辑信息(nfo)', () => nfoModal(code, m.nfo, { lib: r._lib, onlyCode: r.only_code }));
   // Crawling stays opt-in per title: these two never run on their own.
   btn('在浏览器中打开', async () => {
     setStatus('正在 JavDB 查找 ' + code + '…');
@@ -1978,6 +2394,7 @@ async function openDetail(code) {
         await reloadRows();
         await loadEntities();
         applyFilters();
+        refreshDrawer();
       } catch (e) {
         setStatus('覆写失败：' + e.message, 8000);
       }
@@ -2003,15 +2420,87 @@ async function openDetail(code) {
     body.append(strip);
   }
 
-  const desc = el('div', 'desc', clean(r.movie_源简));
-  body.append(desc);
-  host.append(hero, body);
+  body.append(el('div', 'desc', clean(r.movie_源简)));
+  return { node: body, m, stills, needAvatar };
+}
+
+async function openDetail(code, opts = {}) {
+  const request = ++detailRequest;
+  const row = state.byCode.get(code);
+  const drawerWasHidden = $('#inspector').classList.contains('hidden');
+  const priorCode = state.detailCode;
+  state.detailCode = code;
+  const host = $('#detail');
+  const opening = host.classList.contains('hidden');
+  const focusLabel = host.contains(document.activeElement) ? document.activeElement.textContent : '';
+  if (opening) detailReturnFocus = document.activeElement;
+  host.classList.remove('hidden');
+  $('#detailBackdrop').classList.remove('hidden');
+  $('#appShell').inert = true;
+  host.textContent = '';
+  const hero = el('div', 'hero');
+  const close = el('button', 'ghost close', '×');
+  close.setAttribute('aria-label', '关闭完整详情');
+  close.onclick = closeDetail;
+  hero.append(close);
+  const loading = el('div', 'body hint', '读取中…');
+  host.append(hero, loading);
+  if (opening) close.focus();
+  paintSelection();
+  // Double-click/Enter opens the overlay, but the record behind it stays inspectable:
+  // closing the overlay returns to the same drawer.
+  if (drawerWasHidden || priorCode !== code || opts.refreshDrawer) openDrawer(code, { background: true });
+  let r;
+  try {
+    r = await A.row(code, row && row._lib);
+  } catch (error) {
+    if (request === detailRequest) loading.textContent = '读取失败：' + error.message;
+    return;
+  }
+  if (request !== detailRequest || state.detailCode !== code || host.classList.contains('hidden')) return;
+  if (!r) {
+    loading.textContent = '未找到记录';
+    return;
+  }
+  loading.remove();
+  const m = r._media || mediaCache[code] || null;
+  if (m) mediaCache[code] = m;
+  const bg = el('img');
+  bg.alt = code + ' 封面';
+  bg.src = A.imgUrl((m && (m.fanart || m.poster)) || fanartRel(code));
+  bg.onerror = () => bg.remove();
+  hero.prepend(bg);
+
+  const { node: body, needAvatar } = detailContent(r, code);
+  host.append(body);
+  if (needAvatar.length) {
+    resolveAvatars(needAvatar, () => {
+      if (state.detailCode === code && !$('#detail').classList.contains('hidden')) openDetail(code, { refreshDrawer: true });
+    });
+  }
+  if (!topModal() && $('#lightbox').classList.contains('hidden')) {
+    const focused = [...host.querySelectorAll('button')].find(b => focusLabel && b.textContent === focusLabel);
+    (focused || close).focus();
+  }
 }
 
 function closeDetail() {
-  state.detailCode = null;
+  detailRequest++;
+  const wasOpen = !$('#detail').classList.contains('hidden');
+  const back = detailReturnFocus;
   $('#detail').classList.add('hidden');
-  for (const c of $$('#gridItems .card')) c.classList.remove('sel');
+  $('#detail').textContent = '';
+  $('#detailBackdrop').classList.add('hidden');
+  $('#appShell').inert = false;
+  if (wasOpen) {
+    const usable = back && back.isConnected && back.offsetParent !== null;
+    const drawerOpen = !$('#inspector').classList.contains('hidden');
+    const full = drawerOpen && $('#inspector [data-inspect="full"]');
+    const card = $$('#secondary .card, #gridItems .card')
+      .find(c => c.dataset.code === state.detailCode && c.offsetParent !== null);
+    (usable ? back : full || card || $('#navHome')).focus();
+  }
+  detailReturnFocus = null;
 }
 
 async function toggleState(code, field) {
@@ -2026,10 +2515,11 @@ async function toggleState(code, field) {
   row[field] = nv;
   derive(row);
   applyFilters();
-  if (state.detailCode === code) openDetail(code);
+  if (state.detailCode === code && !$('#inspector').classList.contains('hidden')) refreshDrawer();
+  if (state.detailCode === code && !$('#detail').classList.contains('hidden')) openDetail(code);
 }
 
-function quickMenu(e, code) {
+function quickMenu(code) {
   const row = state.byCode.get(code);
   if (!row) return;
   const shut = modal('' + code, (m) => {
@@ -2110,7 +2600,7 @@ function quickMenu(e, code) {
       if (!ok) return;
       try {
         const r = await A.dbRemove(code, row._lib);
-        if (state.detailCode === code) closeDetail();
+        if (state.detailCode === code) closeAllDetails();
         await reloadRows();
         render();
         setStatus(r.removed ? `已从库中删除 ${code}（文件未改动）` : '库里没有这条记录', 6000);
@@ -2119,7 +2609,6 @@ function quickMenu(e, code) {
       }
     });
   });
-  e.stopPropagation();
 }
 
 /* ----------------------------------------------------------------- lightbox */
@@ -2165,7 +2654,7 @@ function topModal() {
   return modalStack.length ? modalStack[modalStack.length - 1] : null;
 }
 
-function modal(title, build) {
+function modal(title, build, onClose) {
   const host = $('#modalHost');
   // 关掉以后焦点回到打开它的那个按钮,而不是掉回页面顶部。
   const back = document.activeElement;
@@ -2182,6 +2671,13 @@ function modal(title, build) {
     if (at >= 0) modalStack.length = at;
     host.classList.add('hidden');
     host.textContent = '';
+    if (onClose) {
+      try {
+        onClose();
+      } catch {
+        /* a failed cleanup must not strand the modal host */
+      }
+    }
     if (back && back.focus) {
       try {
         back.focus();
@@ -2804,6 +3300,50 @@ function wikiFillRow(name, inputs) {
   return box;
 }
 
+// The target of a merge has to be somebody who really exists. Typing her name by hand is
+// how a merge looks like it did nothing: one character off creates a profile nobody has a
+// poster for, and the two tiles stay on the wall exactly as they were.
+function mergeTargetModal(name, onPick) {
+  const pool = new Map();
+  for (const [n, c] of (facetData.actor || [])) pool.set(n, c);
+  for (const p of state.idols) if (!pool.has(p.name)) pool.set(p.name, 0);
+  pool.delete(name);
+  const all = [...pool].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'));
+  modal(`把「${name}」合并到哪位女优`, (m, close) => {
+    m.append(hint('只能选列表里的人。合并是记下「这两个写法是同一个人」，之后她的作品并到一处；库里的 nfo 文件不改动。'));
+    const q = input('', '输入几个字筛选');
+    q.className = 'mergesearch';
+    q.placeholder = '输入几个字筛选';
+    const list = el('div', 'mergepick');
+    const paint = () => {
+      const term = q.value.trim().toLowerCase();
+      const hit = (term ? all.filter(([n]) => n.toLowerCase().includes(term)) : all).slice(0, 80);
+      list.textContent = '';
+      if (!hit.length) list.append(el('p', 'hint', '没有匹配的女优，换一个说法试试。'));
+      for (const [n, c] of hit) {
+        const b = el('button', 'ghost pickrow');
+        b.append(el('span', 'pickname', n), el('span', 'pickn', c ? `${c} 部` : '库里没有作品'));
+        b.onclick = () => {
+          close();
+          onPick(n);
+        };
+        list.append(b);
+      }
+      if (all.length > hit.length) list.append(el('p', 'hint', `只显示前 ${hit.length} 个，共 ${all.length} 位候选。继续输入缩小范围。`));
+    };
+    q.oninput = paint;
+    q.onkeydown = (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const first = list.querySelector('button.pickrow');
+      if (first) first.click();
+    };
+    paint();
+    m.append(q, list);
+    q.focus();
+  });
+}
+
 function idolModal(name, count) {
   const existing = state.idolMap.get(name) || { name, aliases: [] };
   modal('编辑女优信息', (m, close) => {
@@ -2844,7 +3384,9 @@ function idolModal(name, count) {
           aliases: SPLIT(aliasIn.value.replace(/[，,、;；]/g, '/'))
         });
         await loadIdols();
-        renderFacets();
+        // 别名可以手打，改完就得当场把两个人并起来，不能等下一次启动。
+        buildFacets();
+        applyFilters();
         close();
         setStatus('女优资料已保存');
       } catch (e) {
@@ -2852,16 +3394,18 @@ function idolModal(name, count) {
       }
     };
     merge.onclick = () => {
-      const target = window.prompt(`把「${name}」合并到哪位女优？输入目标名字`);
-      if (!target) return;
-      A.idolMerge(name, target.trim())
-        .then(async () => {
-          await loadIdols();
-          renderFacets();
-          close();
-          setStatus(`已合并到 ${target.trim()}`);
-        })
-        .catch((e) => setStatus('合并失败：' + e.message, 6000));
+      mergeTargetModal(name, (target) => {
+        A.idolMerge(name, target)
+          .then(async (res) => {
+            await loadIdols();
+            buildFacets();
+            applyFilters();
+            close();
+            const carried = (res && res.filled ? res.filled.length : 0) + (res && res.avatar ? 1 : 0);
+            setStatus(carried ? `已合并到 ${target}，顺带把她空着的 ${carried} 项补上了` : `已合并到 ${target}`);
+          })
+          .catch((e) => setStatus('合并失败：' + e.message, 6000));
+      });
     };
     btns.append(save, merge, cancel);
     m.append(btns);
@@ -2930,38 +3474,47 @@ function idolListModal() {
 
 /* ---------------------------------------------------------------- settings */
 
-const SETTINGS_SPEC = [
-  ['外观', [
-    ['appearance.theme', '程序皮肤', 'select', [['dark', '深色'], ['light', '浅色']]],
-    ['appearance.radius', '封面圆角度', 'range', [0, 24, 1]],
-    ['appearance.badgeSubtitle', '封面显示字幕标签', 'check', '字幕状态为「真」的条目，左上角出一枚「字」；没有字幕状态就没有'],
-    ['appearance.badgeResolution', '封面显示分辨率标签', 'check', '分辨率取自文件名里的 4K/1080/720 等字样；文件名没写就没有标签可显示'],
-    ['appearance.badgeCount', '封面显示评分与已看标签', 'check', '评分★需要 nfo 里有评分且 ≥4；「已看」标记只看状态，不依赖评分'],
-    ['appearance.listCategory', '封面显示类别标签', 'check', '类别来自 nfo 的 类别/标签 字段，最多显示每行标签数 × 2 个里的前 3 个'],
-    ['appearance.listSeries', '封面显示系列标签', 'check', '系列名单独出一枚标签（不再和类别混在一起）；nfo 里没有系列就没有'],
+const SETTINGS_TABS = [
+  ['appearance', '外观'],
+  ['playback', '播放'],
+  ['shortcuts', '快捷键'],
+  ['data', '数据与扩展']
+];
+
+const SETTINGS_SPEC = {
+  appearance: [
+    ['appearance.theme', '主题', 'select', [['auto', '跟随系统'], ['dark', '深色'], ['light', '浅色']], '跟随系统：Windows 切换深浅色时，界面和窗口底色一起切换'],
+    ['appearance.radius', '封面圆角', 'range', [0, 24, 1], '海报四个角的圆角大小，0 为直角'],
+    ['appearance.badgeSubtitle', '字幕标签', 'check', '字幕状态为「真」的条目，封面左上角出一枚「字」；没有字幕状态就没有'],
+    ['appearance.badgeResolution', '分辨率标签', 'check', '分辨率取自文件名里的 4K/1080/720 等字样；文件名没写就没有标签可显示'],
+    ['appearance.badgeCount', '评分与已看', 'check', '评分★需要 nfo 里有评分且 ≥4；「已看」标记只看状态，不依赖评分'],
+    ['appearance.listCategory', '类别标签', 'check', '类别来自 nfo 的 类别/标签 字段，最多显示每行标签数 × 2 个里的前 3 个'],
+    ['appearance.listSeries', '系列标签', 'check', '系列名单独出一枚标签（不再和类别混在一起）；nfo 里没有系列就没有'],
     ['appearance.staticLoad', '封面静态加载', 'check', '勾选=滚动到位才解码（省内存）；取消=提前多加载几行'],
-    ['appearance.minWidth', '窗口最小宽度', 'number'],
-    ['uiScale', '界面缩放', 'range', [0.8, 1.6, 0.05]]
-  ]],
-  ['播放', [
-    ['playback.player', '播放器', 'select', [['system', '系统默认播放器（无需安装 PotPlayer）'], ['custom', '指定播放器程序']]],
+    ['appearance.minWidth', '最小窗口宽度', 'number', null, '窗口能被拖到多窄；低于这个值会停住'],
+    ['uiScale', '界面缩放', 'range', [0.8, 1.6, 0.05], '整个界面的缩放比例']
+  ],
+  playback: [
+    ['playback.player', '播放器', 'select', [['system', '系统默认播放器'], ['custom', '指定播放器程序']], '系统默认播放器无需安装 PotPlayer；指定程序适合固定用 PotPlayer 的情况'],
     ['playerPath', '播放器路径', 'text', '只在上面选「指定播放器程序」时用；填可执行文件完整路径，路径无效时自动退回系统默认播放器'],
     ['playback.loop', '循环播放', 'check', '仅对指定路径的 PotPlayer 追加 /loop 参数；系统默认播放器由播放器自己控制'],
     ['playback.statFile', '读取视频文件信息', 'check', '播放前读取文件大小并显示在状态栏']
-  ]],
-  ['快捷', [
-    ['shortcuts.hotkey', '呼出窗口热键', 'select', ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'].map((k) => [k, k])],
+  ],
+  shortcuts: [
+    ['shortcuts.hotkey', '呼出窗口热键', 'select', ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'].map((k) => [k, k]), '在任何程序里按下这个键都能把 JavShelf 叫到前面'],
     ['shortcuts.tray', '最小化到托盘', 'check', '关闭按钮改为隐藏窗口，从托盘菜单退出'],
-    ['shortcuts.autostart', '开机启动', 'check'],
-    ['shortcuts.startupTip', '打开提示', 'check']
-  ]],
-  ['数据', [
-    ['dataDir', '数据目录', 'text', '旧程序存放它自己的数据库和旧海报/剧照/头像图的那层目录。填了：导入旧库、读旧图、以及头像写回同一处；留空：JavShelf 用程序目录旁的 JavShelf-data 自己存，功能一样，只是不读旧程序的库。'],
+    ['shortcuts.autostart', '开机启动', 'check', '登录 Windows 后自动启动 JavShelf'],
+    ['shortcuts.startupTip', '打开提示', 'check', '启动后显示一行操作提示']
+  ],
+  data: [
+    ['dataDir', '数据目录', 'text', '旧程序存放数据库和旧海报/剧照/头像图的那层目录。填了：导入旧库、读旧图、以及头像写回同一处；留空：JavShelf 用程序目录旁的 JavShelf-data 自己存'],
     ['proxy', '代理', 'text', '抓取头像用，如 http://127.0.0.1:7890'],
     ['javdbCookie', 'JavDB Cookie', 'text', '点下面的「从 Chrome 获取 Cookie」自动填；也可以手工粘贴 javdb.com 的 Cookie。留空时身高/三围走日文维基'],
-    ['javdbThrottle', '抓取间隔(ms)', 'number', '低于 900 容易被 JavDB 边缘节点回 502']
-  ]]
-];
+    ['javdbThrottle', '抓取间隔(ms)', 'number', null, '低于 900 容易被 JavDB 边缘节点回 502'],
+    ['bridge.enabled', '打开本地桥接', 'check', '浏览器拓展通过它查询「本地有没有这部」并调用播放器。只监听 127.0.0.1，且要求拓展专用的请求头'],
+    ['bridge.port', '桥接端口', 'number', null, '拓展选项页里填同一个端口（默认 45789）；端口被别的程序占用时会显示未启动']
+  ]
+};
 
 const dig = (o, p) => p.split('.').reduce((x, k) => (x == null ? undefined : x[k]), o);
 function put(obj, p, v) {
@@ -2972,16 +3525,57 @@ function put(obj, p, v) {
 }
 
 function settingsModal() {
+  const before = { ...state.app };
+  let saved = false;
+  let previewed = false;
+  const revertPreview = () => {
+    if (saved || !previewed) return;
+    state.app = { ...before };
+    applyAppearance();
+    render();
+  };
   modal('设置', (m, close) => {
+    m.classList.add('settings-modal');
     const patch = {};
-    for (const [group, items] of SETTINGS_SPEC) {
-      m.append(el('div', 'grouph', group));
-      if (group === '数据') {
-        const row = el('div', 'row');
-        const grab = el('button', 'ghost', '从 Chrome 获取 Cookie');
-        const grabLabel = grab.textContent;
-        grab.title = '用你自己的 Chrome 打开 javdb.com，登录后自动取回 Cookie；只需登录一次，以后点一下就回填';
-        grab.onclick = async () => {
+    const touched = new Set();
+    const controls = new Map();
+    const valueOf = (path) => (touched.has(path) ? dig(patch, path) : dig(state.cfg, path));
+    const set = (path, value, live = true) => {
+      put(patch, path, value);
+      touched.add(path);
+      if (live) {
+        if (path.startsWith('appearance.')) previewed = true;
+        liveApply(path, value);
+      }
+    };
+
+    const tabs = el('div', 'settings-tabs');
+    tabs.setAttribute('role', 'tablist');
+    const pane = el('div', 'settings-pane');
+    const footer = el('div', 'settings-footer');
+    m.append(tabs, pane, footer);
+
+    const makeRow = (label, node, help) => {
+      const row = el('div', 'settings-row');
+      row.append(el('span', 'settings-label', label), node);
+      if (help) node.title = row.title = help;
+      return row;
+    };
+    const action = (label, title, fn) => {
+      const b = el('button', 'ghost', label);
+      if (title) b.title = title;
+      b.onclick = fn;
+      return b;
+    };
+
+    const paintDataTools = () => {
+      const block = el('div', 'settings-block');
+      block.append(el('div', 'settings-block-title', '头像与缓存'));
+      const tools = el('div', 'settings-tools');
+      const grab = action(
+        '从 Chrome 获取 Cookie',
+        '用你自己的 Chrome 打开 javdb.com，登录后自动取回 Cookie；只需登录一次，以后点一下就回填',
+        async () => {
           grab.disabled = true;
           grab.textContent = '等待 Chrome 里登录…';
           setStatus('已打开 Chrome：请在里面登录 JavDB。那个窗口不会自动关闭，登录完成后会自动回填，之后你自己关掉它即可');
@@ -2989,7 +3583,8 @@ function settingsModal() {
             const r = await A.javdbCookieFromChrome();
             if (r.ok) {
               state.cfg.javdbCookie = r.cookie;
-              put(patch, 'javdbCookie', r.cookie);
+              set('javdbCookie', r.cookie, false);
+              if (controls.get('javdbCookie')) controls.get('javdbCookie').value = r.cookie;
               setStatus(
                 `已回填 ${r.count} 条 Cookie，点保存设置生效` + (r.looksLoggedIn ? '' : '（未检测到登录状态，若抓取仍无权限请在 Chrome 里重新登录）'),
                 9000
@@ -2999,23 +3594,23 @@ function settingsModal() {
             setStatus('读取失败：' + e.message, 9000);
           }
           grab.disabled = false;
-          grab.textContent = grabLabel;
-        };
-        const impDir = el('button', 'ghost', '导入头像文件夹');
-        impDir.onclick = async () => {
-          const d = await A.pickDir();
-          if (!d) return;
-          await runLocalAvatarImport({ dir: d });
-        };
-        const impZip = el('button', 'ghost', '导入头像压缩包');
-        impZip.onclick = async () => {
-          const z = await A.pickZipFile();
-          if (!z) return;
-          await runLocalAvatarImport({ zip: z });
-        };
-        const asCov = el('button', 'ghost', '头像设为封面墙封面');
-        asCov.title = '把已有本地头像的女优，她的头像直接用作女优封面墙的封面；没有头像的保持默认（发行最早那部作品的封面）';
-        asCov.onclick = async () => {
+          grab.textContent = '从 Chrome 获取 Cookie';
+        }
+      );
+      const impDir = action('导入头像文件夹', '', async () => {
+        const d = await A.pickDir();
+        if (!d) return;
+        await runLocalAvatarImport({ dir: d });
+      });
+      const impZip = action('导入头像压缩包', '', async () => {
+        const z = await A.pickZipFile();
+        if (!z) return;
+        await runLocalAvatarImport({ zip: z });
+      });
+      const asCov = action(
+        '头像设为封面墙封面',
+        '把已有本地头像的女优，她的头像直接用作女优封面墙的封面；没有头像的保持默认（发行最早那部作品的封面）',
+        async () => {
           asCov.disabled = true;
           try {
             const r = await A.actorUseAvatarsAsCovers();
@@ -3026,10 +3621,12 @@ function settingsModal() {
             setStatus('设置失败：' + e.message, 8000);
           }
           asCov.disabled = false;
-        };
-        const cache = el('button', 'ghost', '清空图片缓存');
-        cache.title = '网盘挂载盘（如 X:）上的海报与 nfo 会在每次库扫描结束时自动预热一份本地副本（本地快盘不复制，变了的重取）；这里显示占用并可清空';
-        cache.onclick = async () => {
+        }
+      );
+      const cache = action(
+        '清空图片缓存',
+        '网盘挂载盘（如 X:）上的海报与 nfo 会在每次库扫描结束时自动预热一份本地副本（本地快盘不复制，变了的重取）；这里显示占用并可清空',
+        async () => {
           cache.disabled = true;
           try {
             const info = await A.imgCacheInfo();
@@ -3047,73 +3644,141 @@ function settingsModal() {
             setStatus('图片缓存操作失败：' + e.message, 8000);
           }
           cache.disabled = false;
-        };
-        row.append(grab, impDir, impZip, asCov, cache);
-        m.append(row);
-      }
-      for (const [path, label, kind, arg] of items) {
-        const cur = dig(state.cfg, path);
+        }
+      );
+      tools.append(grab, impDir, impZip, asCov, cache);
+      block.append(tools);
+      pane.append(block);
+
+      const ext = el('div', 'settings-block');
+      ext.append(el('div', 'settings-block-title', '浏览器拓展'));
+      const status = el('div', 'settings-note', '状态读取中…');
+      const show = async () => {
+        try {
+          const b = await A.bridgeStatus();
+          const n = b.stats || {};
+          status.textContent = b.running
+            ? `运行中：127.0.0.1:${b.port}　查询 ${n.lookups || 0} 次 · 播放 ${n.plays || 0} 次 · 挡下没带专用头的请求 ${n.rejected || 0} 次`
+            : b.error
+              ? '未启动：' + b.error
+              : '未开启（勾上「打开本地桥接」再保存）';
+        } catch (e) {
+          status.textContent = '状态读取失败：' + e.message;
+        }
+      };
+      const open = action('打开拓展所在文件夹', '', async () => {
+        try {
+          const r = await A.bridgeOpenExtension();
+          if (!r.ok) setStatus('打不开拓展目录：' + r.error, 7000);
+        } catch (e) {
+          setStatus('打不开拓展目录：' + e.message, 7000);
+        }
+      });
+      const refresh = action('刷新状态', '', show);
+      const row = el('div', 'settings-tools');
+      row.append(open, refresh);
+      ext.append(row, status);
+      ext.append(
+        hint('装法：浏览器里打开 chrome://extensions（Edge 是 edge://extensions）→ 开启「开发者模式」→「加载已解压的扩展程序」→ 选 extension 目录；再在拓展的选项页里填桥接端口。')
+      );
+      pane.append(ext);
+      show();
+    };
+
+    const buildPane = (key) => {
+      pane.textContent = '';
+      controls.clear();
+      const list = el('div', 'settings-list');
+      for (const [path, label, kind, arg, help] of SETTINGS_SPEC[key]) {
+        const cur = valueOf(path);
         let node;
+        let extra = null;
         if (kind === 'check') {
           node = el('input');
           node.type = 'checkbox';
           node.checked = !!cur;
-          node.onchange = () => {
-            put(patch, path, node.checked);
-            liveApply(path, node.checked);
-          };
+          node.onchange = () => set(path, node.checked);
         } else if (kind === 'select') {
           node = select(arg, cur);
-          node.onchange = () => {
-            put(patch, path, node.value);
-            liveApply(path, node.value);
-          };
+          node.onchange = () => set(path, node.value);
         } else if (kind === 'range') {
           node = el('input');
           node.type = 'range';
           [node.min, node.max, node.step] = arg;
           node.value = cur == null ? arg[0] : cur;
-          const out = el('span', 'num', String(cur));
+          extra = el('span', 'num', String(node.value));
           node.oninput = () => {
-            out.textContent = node.value;
-            put(patch, path, Number(node.value));
-            liveApply(path, Number(node.value));
+            extra.textContent = node.value;
+            set(path, Number(node.value));
           };
-          m.append(field(label, node, out));
-          continue;
         } else {
-          node = input(cur, typeof arg === 'string' ? arg : '');
+          node = input(cur);
           if (kind === 'number') node.type = 'number';
-          node.oninput = () => put(patch, path, kind === 'number' ? Number(node.value) : node.value.trim());
+          node.oninput = () => set(path, kind === 'number' ? Number(node.value) : node.value.trim());
         }
-        m.append(field(label, node, typeof arg === 'string' && kind === 'check' ? arg : ''));
+        node.dataset.setting = path;
+        const row = makeRow(label, node, help);
+        if (extra) row.append(extra);
+        controls.set(path, node);
+        list.append(row);
       }
+      pane.append(list);
+      if (key === 'data') paintDataTools();
+    };
+
+    let current = 'appearance';
+    const paintTabs = () => {
+      for (const b of tabs.querySelectorAll('button')) {
+        const on = b.dataset.settingsTab === current;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', String(on));
+      }
+    };
+    for (const [key, label] of SETTINGS_TABS) {
+      const b = el('button', null, label);
+      b.dataset.settingsTab = key;
+      b.setAttribute('role', 'tab');
+      b.onclick = () => {
+        current = key;
+        paintTabs();
+        buildPane(key);
+      };
+      tabs.append(b);
     }
-    m.append(hint('配置文件：' + (state.cfg.config ? state.cfg.config.file : '')));
-    const btns = el('div', 'row');
-    const save = el('button', 'ghost primary', '保存设置');
-    const bak = el('button', 'ghost', '立即备份数据库');
-    const cancel = el('button', 'ghost', '取消');
-    cancel.onclick = close;
-    bak.onclick = async () => {
+
+    const pathNote = el('span', 'settings-path', state.cfg.config ? '配置：' + state.cfg.config.file : '');
+    const backup = action('立即备份数据库', '把当前媒体库备份到数据目录', async () => {
       try {
         setStatus('已备份：' + (await A.backup()), 6000);
       } catch (e) {
         setStatus('备份失败：' + e.message, 5000);
       }
-    };
+    });
+    const cancel = el('button', 'ghost', '取消');
+    cancel.onclick = close;
+    const save = el('button', 'ghost primary', '保存设置');
     save.onclick = async () => {
       const cfg = await A.saveSettings(patch);
+      saved = true;
       state.cfg = cfg;
       state.app = { ...state.app, ...cfg.appearance };
       applyAppearance();
       render();
-      setStatus('设置已保存并生效');
+      // 桥接开没开成一句话说清：起不来（端口被占）时不能只写「已保存」。
+      if (patch.bridge) {
+        const b = cfg.bridge || {};
+        setStatus(
+          b.running ? `浏览器桥接已启动 127.0.0.1:${b.port}` : b.enabled ? `浏览器桥接没起来：${b.error || '未知原因'}` : '浏览器桥接已关闭',
+          8000
+        );
+      } else setStatus('设置已保存并生效');
       close();
     };
-    btns.append(save, bak, cancel);
-    m.append(btns);
-  });
+    footer.append(pathNote, el('div', 'spacer'), backup, cancel, save);
+
+    paintTabs();
+    buildPane(current);
+  }, revertPreview);
 }
 
 // Some settings are worth seeing immediately, before pressing 保存.
@@ -3201,7 +3866,7 @@ const NFO_FIELDS = [
   ['plot', '简介', 'area'], ['outline', '概要', 'area'], ['website', '网址', 'text']
 ];
 
-async function nfoModal(code, nfoRel) {
+async function nfoModal(code, nfoRel, meta = {}) {
   modal('编辑信息 · ' + code, async (m, close) => {
     let doc;
     try {
@@ -3246,13 +3911,33 @@ async function nfoModal(code, nfoRel) {
         const [name, role] = line.split('|');
         return { name: (name || '').trim(), role: (role || '').trim() };
       }).filter((a) => a.name);
+      // Remember which surface opened the editor: a drawer edit refreshes the drawer, and
+      // only a full-detail edit rebuilds the overlay. It used to pop the overlay every time.
+      const overlayOpen = !$('#detail').classList.contains('hidden');
+      const drawerOpen = !$('#inspector').classList.contains('hidden');
       try {
-        const res = await A.nfoWrite(nfoRel, { fields, actors });
+        const res = await A.nfoWrite(nfoRel, {
+          fields,
+          actors,
+          code,
+          lib: meta.lib,
+          onlyCode: meta.onlyCode
+        });
         setStatus(res.changed ? '已保存 nfo（备份：' + res.backup.split(/[\/\x5c]/).pop() + '）' : '没有改动', 5000);
         if (res.changed) {
           delete mediaCache[code];
+          if (res.refreshed) await reloadRows();
+          if (overlayOpen) {
+            await openDetail(code);
+            if (drawerOpen) await openDrawer(code, { background: true });
+          } else if (drawerOpen) {
+            await openDrawer(code, { background: true });
+          }
           close();
-          openDetail(code);
+          if (!topModal()) {
+            if (!$('#detail').classList.contains('hidden')) $('#detail .close').focus();
+            else if (drawerOpen) ($('#inspector [data-inspect="full"]') || $('#navHome')).focus();
+          }
         }
       } catch (e) {
         setStatus('保存失败：' + e.message, 6000);
@@ -3263,11 +3948,84 @@ async function nfoModal(code, nfoRel) {
   });
 }
 
+function manageModal() {
+  modal('管理中心', (m, close) => {
+    m.classList.add('wide');
+    m.append(hint('浏览归浏览，管理归管理。已有的工具和数据操作都在这里。'));
+    const grid = el('div', 'manage-grid');
+    const entries = [
+      ['libraries', '媒体库管理', '添加目录、入库、扫描与备份', libsModal],
+      ['avatars', '演员头像', '导入、匹配与封面管理', avatarModal],
+      ['idols', '演员资料', '资料编辑、别名与合并', idolListModal],
+      ['dupes', '查重报告', '查看重复记录，不自动删除文件', dupesModal],
+      ['display', '显示设置', '密度、瀑布流、各级页面排列', displayModal],
+      ['settings', '偏好设置', '外观、播放、快捷、数据与浏览器拓展', settingsModal],
+      ['logs', '运行日志', '查看扫描、抓取与错误记录', logModal],
+      ['jobs', '后台任务', '查看最近的进度与停止入口', () => {
+        const box = $('#jobPanel');
+        if (box.children.length) box.classList.remove('hidden');
+        else modal('后台任务', m => m.append(hint('当前没有后台任务。')));
+      }]
+    ];
+    for (const [key, title, description, run] of entries) {
+      const b = el('button', 'manage-card');
+      b.dataset.manage = key;
+      b.append(el('b', null, title), el('span', null, description));
+      b.onclick = () => { close(); run(); };
+      grid.append(b);
+    }
+    m.append(grid);
+  });
+}
+
 /* -------------------------------------------------------------------- wire */
 
 function wireUi() {
+  $('#navHome').onclick = () => { state.nav = []; setQuick('all'); };
+  $('#navFavorites').onclick = () => { state.nav = []; setQuick('fav'); };
+  $('#btnManage').onclick = manageModal;
+  $('#btnLibraries').onclick = () => libsModal();
+  $$('#libraryIntro .stat-num').forEach((b) => {
+    b.onclick = () => {
+      state.nav = [];
+      setQuick(b.dataset.stat);
+    };
+  });
+  $('#btnFilters').onclick = () => setFiltersOpen($('#filterPanel').classList.contains('hidden'));
+  $('#closeFilters').onclick = () => setFiltersOpen(false);
+  $('#detailBackdrop').onclick = closeDetail;
+  const grip = $('#inspector .drawer-grip');
+  let drawerDrag = null;
+  grip.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    drawerDrag = { startX: e.clientX, startW: $('#inspector').getBoundingClientRect().width };
+    try { grip.setPointerCapture(e.pointerId); } catch { /* synthetic pointers cannot be captured */ }
+    e.preventDefault();
+  });
+  grip.addEventListener('pointermove', (e) => {
+    if (!drawerDrag) return;
+    setDrawerWidth(drawerDrag.startW + drawerDrag.startX - e.clientX, true);
+  });
+  const endDrawerDrag = () => { drawerDrag = null; };
+  grip.addEventListener('pointerup', endDrawerDrag);
+  grip.addEventListener('pointercancel', endDrawerDrag);
+  grip.addEventListener('dblclick', () => setDrawerWidth(DRAWER_DEFAULT, true));
+  for (const id of ['#gridHost', '#secondary']) {
+    $(id).addEventListener('pointerdown', (e) => {
+      if (!e.target.closest('.card')) closeDrawer({ focus: false });
+    });
+  }
+  $$('.rail-link').forEach(b => { b.title = b.textContent.trim(); b.setAttribute('aria-label', b.textContent.trim()); });
+  const searchActor = $('#searchActor');
+  const paintActorSuggest = () => {
+    const name = actorJumpName($('#search').value);
+    searchActor.dataset.actor = name;
+    searchActor.textContent = name ? `按 Enter 进入演员「${name}」` : '';
+    searchActor.classList.toggle('hidden', !name);
+  };
   let deb = 0;
   $('#search').oninput = (e) => {
+    paintActorSuggest();
     clearTimeout(deb);
     deb = setTimeout(() => {
       state.filters.q = e.target.value;
@@ -3275,6 +4033,19 @@ function wireUi() {
       applyFilters();
     }, 160);
   };
+  $('#search').onfocus = paintActorSuggest;
+  $('#search').onblur = () => setTimeout(() => {
+    if (document.activeElement !== searchActor) searchActor.classList.add('hidden');
+  }, 120);
+  $('#search').onkeydown = (e) => {
+    if (e.key !== 'Enter') return;
+    const name = actorJumpName(e.target.value);
+    if (!name) return;
+    e.preventDefault();
+    jumpToActor(name);
+  };
+  searchActor.onpointerdown = (e) => e.preventDefault();
+  searchActor.onclick = () => jumpToActor(searchActor.dataset.actor);
   $('#sortKey').value = state.sort.key;
   $('#sortKey').onchange = (e) => {
     state.sort.key = e.target.value;
@@ -3295,6 +4066,23 @@ function wireUi() {
   $('#cardWidth').oninput = (e) => {
     state.cardW = Number(e.target.value);
     document.documentElement.style.setProperty('--card-w', state.cardW + 'px');
+  };
+  $('#density').oninput = (e) => {
+    const n = Number(e.target.value);
+    (state.disp.items || (state.disp.items = {})).perRow = n;
+    paintDensity();
+    gridCols(n);
+  };
+  $('#density').onchange = async (e) => {
+    const n = Number(e.target.value);
+    try {
+      const cfg = await A.saveSettings({ display: { items: { ...(state.disp.items || {}), perRow: n } } });
+      state.disp = cfg.display;
+      applyDisplay();
+      setStatus(n ? `海报密度：每行 ${n} 列` : '海报密度：自动', 3000);
+    } catch (err) {
+      setStatus('保存海报密度失败：' + err.message, 6000);
+    }
   };
   paintPageSize();
   $('#pageSize').onchange = (e) => {
@@ -3329,14 +4117,25 @@ function wireUi() {
   // rather than piling up, so the back button always returns to the home wall.
   $$('#wallEntries button').forEach((b) => {
     b.onclick = () => {
+      closeDrawer({ focus: false });
       state.nav = [{ kind: 'covers', type: b.dataset.wall, page: 1 }];
       render();
     };
   });
-  $('#btnAvatars').onclick = () => avatarModal();
-  $('#btnDupes').onclick = () => dupesModal();
   $('#btnLog').onclick = () => logModal();
   addEventListener('keydown', (e) => {
+    const detailOpen = !$('#detail').classList.contains('hidden');
+    const layer = topModal()?.node || (detailOpen ? $('#detail') : null);
+    const typing = document.activeElement?.matches('input, textarea, select, [contenteditable="true"]');
+    if (e.key === 'Tab' && layer && $('#lightbox').classList.contains('hidden')) {
+      const focusable = [...layer.querySelectorAll('button, input, select, textarea, [tabindex="0"], a[href]')].filter(x => !x.disabled && x.getClientRects().length);
+      const first = focusable[0] || layer;
+      const last = focusable[focusable.length - 1] || layer;
+      if (!layer.contains(document.activeElement) || (e.shiftKey && document.activeElement === first) || (!e.shiftKey && document.activeElement === last)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      }
+    }
     if (e.key === 'Escape') {
       if (!$('#lightbox').classList.contains('hidden')) return;
       const top = topModal();
@@ -3349,16 +4148,18 @@ function wireUi() {
         $('#modalHost').textContent = '';
         return;
       }
-      if (!$('#detail').classList.contains('hidden')) return closeDetail();
+      if (detailOpen) return closeDetail();
+      if (!$('#inspector').classList.contains('hidden')) return closeDrawer();
+      if (!$('#filterPanel').classList.contains('hidden')) return setFiltersOpen(false);
       // With nothing layered above it, Esc steps back out of the secondary pages.
       if (inSecondary()) return popFrame();
       return;
     }
-    if (e.key === '/' && document.activeElement !== $('#search') && !topModal()) {
+    if (e.key === '/' && !typing && !layer && $('#lightbox').classList.contains('hidden')) {
       e.preventDefault();
       $('#search').focus();
     }
-    if ((e.key === 'PageDown' || e.key === 'PageUp') && document.activeElement !== $('#search')) {
+    if ((e.key === 'PageDown' || e.key === 'PageUp') && !typing && !layer && $('#lightbox').classList.contains('hidden')) {
       e.preventDefault();
       if (state.waterfall) {
         // Nothing swaps out here, so the keys move the viewport; the scroll handler loads.

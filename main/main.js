@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, ipcMain, protocol, screen, shell, globalShortcut, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, protocol, screen, shell, globalShortcut, nativeImage, nativeTheme } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -8,7 +8,7 @@ const { Db } = require('./db');
 const { Media } = require('./media');
 const { ActorStore } = require('./actors');
 const { CoverStore } = require('./covers');
-const { LibraryFiles, resolveDir, VIDEO_EXT } = require('./scan');
+const { LibraryFiles, resolveDir, resolveDirAsync, VIDEO_EXT } = require('./scan');
 const libs = require('./libs');
 const idols = require('./idols');
 const entities = require('./entities');
@@ -16,6 +16,7 @@ const { JavDB, wikiActress, fetchImage, parseActorRef, avatarFor, BASE: BASE_JAV
 const { readNfo, writeNfo, createNfo } = require('./nfo');
 const { ImgCache, SLOW_READ_MS } = require('./imgcache');
 const { collectFromChrome } = require('./chromecookie');
+const { Bridge, normalizeKey } = require('./bridge');
 
 const SCHEME = 'shelfimg';
 const ROOT = path.resolve(__dirname, '..');
@@ -29,30 +30,15 @@ const PORTABLE_DIR =
   process.env.PORTABLE_EXECUTABLE_DIR || (app.isPackaged && fs.existsSync(path.join(EXE_DIR, 'resources', 'app')) ? EXE_DIR : '');
 
 // --user-data lets a second instance (or a test run) keep its own profile.
-const SMOKE = process.env.SHELF_SMOKE || process.argv.includes('--smoke') || process.argv.includes('--smoke-reopen');
-const SMOKE_REOPEN = process.argv.includes('--smoke-reopen');
-// A short live crawl against the real site, so scraper fixes can be verified without the UI suite.
-const SMOKE_CRAWL = process.argv.includes('--smoke-crawl');
-// Restart round trip for the tray entry; it always gets its own profile dir below.
-const SMOKE_RESTART = process.argv.includes('--smoke-restart');
 const PROFILE_FLAG = process.argv.find((a) => a.startsWith('--user-data='));
-let PROFILE_DIR = PROFILE_FLAG ? path.resolve(PROFILE_FLAG.slice('--user-data='.length)) : '';
-// A smoke run must always start from an empty profile, otherwise the second invocation
-// inherits the first one's libraries and never exercises the setup screen. The reopen
-// check is the opposite: it deliberately reuses the profile the full run left behind.
-if (!PROFILE_FLAG && SMOKE && !SMOKE_REOPEN) {
-  PROFILE_DIR = path.join(ROOT, 'out', 'smoke-profile');
-  fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
-}
-// The restart check normally runs against the profile the UI suite left behind, so it proves
-// the libraries survive a relaunch. Without an explicit --user-data it gets a throwaway one,
-// and any stale probe from an earlier attempt is cleared so it cannot fake a match.
-if (SMOKE_RESTART && !PROFILE_FLAG) {
-  PROFILE_DIR = path.join(ROOT, 'out', 'restart-profile');
-  fs.rmSync(path.join(PROFILE_DIR, 'restart-probe.json'), { force: true });
-}
+const PROFILE_DIR = PROFILE_FLAG ? path.resolve(PROFILE_FLAG.slice('--user-data='.length)) : '';
 if (PROFILE_DIR) app.setPath('userData', PROFILE_DIR);
 else if (PORTABLE_DIR) app.setPath('userData', path.join(PORTABLE_DIR, 'JavShelf-data'));
+
+// 同一个配置只允许一个进程：云盘扫描、图片缓存和数据库都不该被第二个实例同时打开。
+// 不同 --user-data 的测试/冒烟实例有各自的锁，仍可并行。
+const instanceLock = app.requestSingleInstanceLock();
+if (!instanceLock) app.quit();
 
 const CONFIG_FILE = PROFILE_DIR
   ? path.join(PROFILE_DIR, 'config.json')
@@ -87,6 +73,8 @@ const DEFAULTS = {
     minWidth: 1080
   },
   playback: { player: 'system', loop: true, statFile: false },
+  // 浏览器拓展的本地桥接：默认关闭，设置里手动开。端口定了之后扩展那边填同一个。
+  bridge: { enabled: false, port: 45789 },
   shortcuts: { hotkey: 'F10', tray: true, startupTip: true, autostart: false },
   display: {
     items: { pageSize: 120, perRow: 0, waterfall: false, titleLines: 2, tagLines: 2, actorLines: 2, hideSeries: false, hideActors: false, hideTags: false, hideActions: false, fullHeart: false },
@@ -123,6 +111,7 @@ let files = null;
 let gridCache = null;
 let libOf = new Map();    // 编码 -> library name, so a write lands in the right database
 let ingestJob = null;
+let bridge = null;        // 浏览器拓展的本地桥接服务
 
 // A small ring buffer the 日志 button reads. Handlers used to swallow their failures into
 // a status toast, which left no trail when something went wrong an hour later.
@@ -150,6 +139,7 @@ function loadConfig() {
       ...raw,
       appearance: { ...DEFAULTS.appearance, ...(raw.appearance || {}) },
       playback: { ...DEFAULTS.playback, ...(raw.playback || {}) },
+      bridge: { ...DEFAULTS.bridge, ...(raw.bridge || {}) },
       display: mergeDisplay(raw.display),
       shortcuts: { ...DEFAULTS.shortcuts, ...(raw.shortcuts || {}) }
     };
@@ -186,8 +176,7 @@ function shelfDbPath() {
   return path.join(app.getPath('userData'), 'JavShelf.db');
 }
 
-// Filename the predecessor program used for its own database. It is a fact about his disk,
-// not a name this app carries: opened read-only to seed libraries and to read rows from.
+// Legacy database filename, opened read-only for library migration and row access.
 const LEGACY_DB_FILE = 'ALEX.db';
 
 function legacyDbPath() {
@@ -219,7 +208,7 @@ function requireActors() {
 // came from and writes go back to the right database.
 // Avatars are ours, not the old program's: they live under 数据目录 when he points us at one,
 // and under our own data folder otherwise, so downloading a photo never needs setup first.
-function boot() {
+function boot(scanDelay = 0) {
   const all = libraryList();
   const active = all.filter((l) => l.enabled !== false);
   dbs = new Map();
@@ -250,7 +239,7 @@ function boot() {
       r._lib = lib.name;
       rows.push(r);
     }
-    startScan(lib);
+    startScan(lib, scanDelay);
   }
   cfg.activeLibrary = active.some((l) => l.name === cfg.activeLibrary) ? cfg.activeLibrary : (active[0] && active[0].name) || '';
   gridCache = { cols: cols || [], rows };
@@ -290,30 +279,83 @@ function scanRootsWanted() {
   return dirs;
 }
 
-function startScan(lib) {
+// 首屏正在读索引、取封面时，别让云盘遍历去抢同一个 libuv 线程池——那 4 条线程一被
+// readdir 占满，图片读取就排在后面，墙看起来像卡住了。启动时晚几秒再开始扫；用户主动
+// 点「重新扫描」仍立即执行。
+const STARTUP_SCAN_DELAY = 8000;
+const STARTUP_SCAN_POLL = 1000;
+const STARTUP_SCAN_MAX_POLLS = 20;
+const startupScans = new Map();
+const runningScans = new Map();
+// 首屏索引外条目的异步解析还在跑时，扫描先别开：两者共用 libuv 那 4 条线程，
+// 扫描一占满，解析和取图就得排队。最多多等 20 秒，盘彻底失联时照常开扫。
+let pendingResolves = 0;
+
+function startScan(lib, delay = 0, force = false) {
   const dirs = (lib && lib.dirs) || [];
   if (!dirs.length || !files) return;
-  const started = Date.now();
-  files
-    .prepare(dirs, {
-      keep: scanRootsWanted(),
-      onProgress: (p) => {
-        if (win && !win.isDestroyed()) win.webContents.send('scan:progress', { ...p, library: lib.name, ms: Date.now() - started });
-      },
-      onIndexed: (dir, index) => warmRoot(dir, index, lib.name),
-      onWarn: (msg) => log('warn', msg)
-    })
-    .then(() => {
-      // 缓存留着不动:预热已经按 size/mtime 补了新的、换了改的、删了没的。
-      // 只有「哪个文件在哪个文件夹」这份会话备忘需要重猜。
-      forgetEntries();
-      if (win && !win.isDestroyed()) win.webContents.send('scan:done', { library: lib.name, entries: files.status() });
-    })
-    .catch((e) => {
-      // Without this the wall just never gets pictures and nothing says why.
-      log('warn', `扫描 ${lib.name} 失败：${(e && e.message) || e}`);
-      if (win && !win.isDestroyed()) win.webContents.send('scan:done', { library: lib.name, error: String((e && e.message) || e), entries: files.status() });
-    });
+  // 先把本地索引装进内存，首屏的 media 解析就能立刻命中；真正的目录遍历仍按 delay 走。
+  files.preload(dirs);
+  const name = (lib && lib.name) || '';
+  const scanDone = () => {
+    const left = (runningScans.get(name) || 1) - 1;
+    if (left > 0) runningScans.set(name, left);
+    else runningScans.delete(name);
+  };
+  const run = () => {
+    runningScans.set(name, (runningScans.get(name) || 0) + 1);
+    const started = Date.now();
+    files
+      .prepare(dirs, {
+        keep: scanRootsWanted(),
+        onProgress: (p) => {
+          if (win && !win.isDestroyed()) win.webContents.send('scan:progress', { ...p, library: lib.name, ms: Date.now() - started });
+        },
+        onIndexed: (dir, index) => warmRoot(dir, index, lib.name),
+        onWarn: (msg) => log('warn', msg)
+      })
+      .then(() => {
+        scanDone();
+        // 缓存留着不动:预热已经按 size/mtime 补了新的、换了改的、删了没的。
+        // 只有「哪个文件在哪个文件夹」这份会话备忘需要重猜。
+        forgetEntries();
+        if (win && !win.isDestroyed()) win.webContents.send('scan:done', { library: lib.name, entries: files.status() });
+      })
+      .catch((e) => {
+        scanDone();
+        // Without this the wall just never gets pictures and nothing says why.
+        log('warn', `扫描 ${lib.name} 失败：${(e && e.message) || e}`);
+        if (win && !win.isDestroyed()) win.webContents.send('scan:done', { library: lib.name, error: String((e && e.message) || e), entries: files.status() });
+      });
+  };
+  // 启动时 boot() 会走两遍（whenReady 一次，渲染进程拿 bootInfo 时一次），界面重载
+  // 还会再走一次。同一库已经有扫描在排队或正在跑时不再叠加——否则云盘上会同时爬两棵树。
+  if (!force) {
+    if (runningScans.has(name)) return;
+    if (startupScans.has(name)) {
+      if (delay > 0) return;
+      clearTimeout(startupScans.get(name));
+      startupScans.delete(name);
+    }
+  } else if (startupScans.has(name)) {
+    clearTimeout(startupScans.get(name));
+    startupScans.delete(name);
+  }
+  if (delay <= 0) return run();
+  let polls = 0;
+  const arm = (wait) => {
+    const timer = setTimeout(() => {
+      if (pendingResolves > 0 && polls++ < STARTUP_SCAN_MAX_POLLS) {
+        arm(STARTUP_SCAN_POLL);
+        return;
+      }
+      startupScans.delete(name);
+      run();
+    }, wait);
+    timer.unref?.();
+    startupScans.set(name, timer);
+  };
+  arm(delay);
 }
 
 // Re-scan 之后把这个根的新条目灌进图片缓存;本地快盘由 warm 内部的探测自己放弃,
@@ -383,8 +425,7 @@ function runIngest(libName, mode) {
 
 // ---------------------------------------------------------------- 图片本地缓存
 // 策略在 main/imgcache.js:慢盘(网盘挂载)的海报与 nfo 靠「扫描完成时预热 + size/mtime 校验」
-// 维护本地副本,刷新不再整目录作废——v1.5.5 的清仓正是「每次刷新都卡」的根源(X: 实测
-// 单张海报 ~2.4 s,而 stat ~0 ms)。协议层命中缓存直接出图,不做远端校验。
+// 维护本地副本，避免慢盘重复读取；协议层命中缓存直接出图，不做远端校验。
 const imgCache = new ImgCache(path.join(app.getPath('userData'), 'imgcache'));
 
 function imageResponse(buf, rel, mtime) {
@@ -425,7 +466,7 @@ function registerImageProtocol() {
       return new Response('forbidden', { status: 403 });
     }
     const volatile = VOLATILE.test(rel);
-    const warm = volatile ? null : imgCache.hit(abs);
+    const warm = volatile ? null : await imgCache.hit(abs);
     if (warm) return imageResponse(warm.buf, rel, warm.mtime);
     // 缓存没命中就现场读原盘:这一步在网盘挂载上实测 ~2.4 s/张,必须走异步,
     // 否则协议层会把整个主进程(连同所有正在出图的请求)卡住。
@@ -456,10 +497,42 @@ function registerImageProtocol() {
   });
 }
 
+// Run `run` over the items with at most `limit` in flight. Used for the handful of cards
+// the in-memory index cannot answer: on a cloud mount every folder read is a network round
+// trip, and doing them one after another used to freeze the main process for seconds.
+async function mapLimit(items, limit, run) {
+  let next = 0;
+  const width = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (next < items.length) {
+        const item = items[next++];
+        await run(item);
+      }
+    })
+  );
+}
+
+// Cards whose entry is answered by the in-memory scan index. No disk read at all; a folder
+// that still needs descending is left to the slow path.
+function entryFromIndex(row, code) {
+  const lib = (row && row._lib) || '';
+  const ck = lib + '\u0000' + String(code);
+  const memo = entryCache.get(ck);
+  if (memo) return memo;
+  const hit = files.lookup(videoBaseName(row && row.file_路径), code, folderHint(code, row));
+  if (!hit || (!hit.video && !hit.nfo)) return null;
+  const entry = finalizeEntry(hit, row, code);
+  entryCache.set(ck, entry);
+  return entry;
+}
+
 // Resolve a batch of codes against the scan index. Only the visible rows ask, so this
 // stays cheap even with 7000 titles, and the answer is a `r<n>/` reference the image
 // protocol can serve without ever learning an absolute path from the page.
-function resolveEntries(codes) {
+// The index answers almost every row synchronously; the rest are resolved async and
+// concurrently, so one stale index can no longer stall the event loop (and every picture).
+async function resolveEntries(codes, opts = {}) {
   const out = {};
   if (!files || !codes.length) return out;
   const byLib = new Map();
@@ -469,6 +542,7 @@ function resolveEntries(codes) {
     if (!byLib.has(lib)) byLib.set(lib, []);
     byLib.get(lib).push(code);
   }
+  const pending = [];
   for (const [lib, list] of byLib) {
     const handle = dbs.get(lib);
     if (!handle) continue;
@@ -476,8 +550,29 @@ function resolveEntries(codes) {
     for (const code of list) {
       const row = meta.get(code);
       if (row) row._lib = lib;
-      out[code] = entryFor(row, code);
+      const fast = entryFromIndex(row, code);
+      if (fast) out[code] = fast;
+      else pending.push({ row, code });
     }
+  }
+  if (pending.length) {
+    pendingResolves += pending.length;
+    const work = mapLimit(pending, ENTRY_FALLBACK_CONCURRENCY, async ({ row, code }) => {
+      let entry = null;
+      try {
+        entry = await entryForSlow(row, code);
+      } catch {
+        /* one bad folder must not take the rest of the page down */
+      } finally {
+        pendingResolves = Math.max(0, pendingResolves - 1);
+      }
+      out[code] = entry;
+      // 墙先拿索引命中的那部分出图，慢行解析完一条补发一条；否则 88 条快行
+      // 要陪着 32 条慢行一起等十几秒，看起来和修之前一样慢。
+      if (opts.partial && win && !win.isDestroyed()) win.webContents.send('media:resolved', { [code]: entry });
+    });
+    if (opts.partial) work.catch(() => {});
+    else await work;
   }
   return out;
 }
@@ -506,6 +601,29 @@ function deepestEntryDir(dir, code) {
   return cur;
 }
 
+// The same walk for the async fallback path: the cloud mount answers a readdir in
+// 0.15~1.4 s, so even one card must not run it on the event loop.
+async function deepestEntryDirAsync(dir, code) {
+  let cur = String(dir || '');
+  const want = String(code || '').toUpperCase();
+  for (let depth = 0; depth < 3; depth++) {
+    let items;
+    try {
+      items = await fsp.readdir(cur, { withFileTypes: true });
+    } catch {
+      return cur;
+    }
+    const holdsVideo = items.some((e) => !e.isDirectory() && VIDEO_EXT.has(path.extname(e.name).toLowerCase()));
+    if (holdsVideo) return cur;
+    const subs = items.filter((e) => e.isDirectory()).map((e) => path.join(cur, e.name));
+    if (!subs.length) return cur;
+    const byCode = want ? subs.find((d) => path.basename(d).toUpperCase().includes(want)) : null;
+    cur = byCode || (subs.length === 1 ? subs[0] : cur);
+    if (!byCode && subs.length > 1) return cur;
+  }
+  return cur;
+}
+
 // V8 parses /[\/]/ in a way that does not match a backslash, so a Windows path failed this
 // test and the exact stored folder was never used. Test the two characters explicitly.
 function isAbsPath(s) {
@@ -518,9 +636,13 @@ function isAbsPath(s) {
 // scroll — so results are memoised for the session and the extra directory walk is skipped when
 // the first attempt already found the files. Cleared whenever the library is re-scanned.
 const entryCache = new Map();
+// 云盘上单个目录读取 0.15~1.4 s；六路并发足够把首屏的索引外条目压到两秒内，
+// 又不会把 libuv 的线程池全占满。
+const ENTRY_FALLBACK_CONCURRENCY = 6;
 function forgetEntries() {
   entryCache.clear();
 }
+
 // One title's cover just changed, so drop only that row's memo. Clearing the whole cache would
 // send every visible card back through resolveDir, which on an unindexed root is a synchronous
 // readdir per card (~200 ms on the cloud mount).
@@ -531,13 +653,35 @@ function forgetEntry(lib, code) {
   }
 }
 
+function finalizeEntry(hit, row, code) {
+  const entry = {
+    lib: (row && row._lib) || cfg.activeLibrary,
+    dir: hit.dir,
+    video: hit.video,
+    name: hit.name,
+    poster: media.relFor(hit.poster || ''),
+    fanart: media.relFor(hit.fanart || ''),
+    thumb: media.relFor(hit.thumb || ''),
+    nfo: media.relFor(hit.nfo || '')
+  };
+  // A cover he picked by hand wins the picture. The folder's own sidecar is kept in the entry
+  // as well, because importing again with 「同时写入影片文件夹」 has to know what it replaces.
+  const custom = covers ? covers.relOf(entry.lib, code) : '';
+  if (custom) {
+    entry.folderPoster = entry.poster;
+    entry.poster = custom;
+    entry.custom = true;
+  }
+  return entry;
+}
+
+// Synchronous single-row lookup, kept for the routes the user drives one at a time
+// (play, nfo, cover import). The batch route below never comes here.
 function entryFor(row, code) {
-  const lib = (row && row._lib) || '';
-  const ck = lib + '\u0000' + String(code);
-  const memo = entryCache.get(ck);
-  if (memo) return memo;
+  const fast = entryFromIndex(row, code);
+  if (fast) return fast;
   const entry = entryForUncached(row, code);
-  if (entry) entryCache.set(ck, entry);
+  if (entry) entryCache.set(((row && row._lib) || '') + '\u0000' + String(code), entry);
   return entry;
 }
 
@@ -557,24 +701,41 @@ function entryForUncached(row, code) {
     const leaf = deepestEntryDir(hit.dir, code);
     if (leaf && leaf !== hit.dir) hit = resolveDir(leaf, videoBaseName(row && row.file_路径)) || hit;
   }
-  const entry = {
-    lib: (row && row._lib) || cfg.activeLibrary,
-    dir: hit.dir,
-    video: hit.video,
-    name: hit.name,
-    poster: media.relFor(hit.poster || ''),
-    fanart: media.relFor(hit.fanart || ''),
-    thumb: media.relFor(hit.thumb || ''),
-    nfo: media.relFor(hit.nfo || '')
-  };
-  // A cover he picked by hand wins the picture. The folder's own sidecar is kept in the entry
-  // as well, because importing again with 「同时写入影片文件夹」 has to know what it replaces.
-  const custom = covers ? covers.relOf(entry.lib, code) : '';
-  if (custom) {
-    entry.folderPoster = entry.poster;
-    entry.poster = custom;
-    entry.custom = true;
+  return finalizeEntry(hit, row, code);
+}
+
+// 同一批解析可能被重复请求（扫描完成会让整墙重渲染一次）；在途的目录读取按
+// 库+编码复用，别让三条请求各读一遍同一个慢目录。
+const resolvingEntries = new Map();
+
+function entryForSlow(row, code) {
+  const ck = ((row && row._lib) || '') + '\u0000' + String(code);
+  const memo = entryCache.get(ck);
+  if (memo) return Promise.resolve(memo);
+  const going = resolvingEntries.get(ck);
+  if (going) return going;
+  const task = entryForSlowUncached(row, code);
+  resolvingEntries.set(ck, task);
+  const clear = () => resolvingEntries.delete(ck);
+  task.then(clear, clear);
+  return task;
+}
+
+// 索引外条目的异步版：和 entryForUncached 同样的步骤，但目录读取全部走 Promise。
+async function entryForSlowUncached(row, code) {
+  const ck = ((row && row._lib) || '') + '\u0000' + String(code);
+  let hit = files.lookup(videoBaseName(row && row.file_路径), code, folderHint(code, row));
+  if (!hit) {
+    const stored = String((row && row.only_code) || '');
+    if (isAbsPath(stored)) hit = await resolveDirAsync(stored, videoBaseName(row.file_路径));
   }
+  if (!hit) return null;
+  if (!hit.video && !hit.nfo) {
+    const leaf = await deepestEntryDirAsync(hit.dir, code);
+    if (leaf && leaf !== hit.dir) hit = (await resolveDirAsync(leaf, videoBaseName(row && row.file_路径))) || hit;
+  }
+  const entry = finalizeEntry(hit, row, code);
+  entryCache.set(ck, entry);
   return entry;
 }
 
@@ -611,10 +772,22 @@ function folderHint(code, row) {
 
 // ---------------------------------------------------------------- window
 
+// Window chrome has to follow the same theme the page resolved: nativeTheme is the one
+// place that knows what 'auto' means, so set it there and read the answer back.
+const THEME_BG = { dark: '#141f26', light: '#f0f5f5' };
+function systemThemeDark() {
+  const theme = cfg.appearance.theme || 'dark';
+  // The config speaks 'auto'; Electron's own switch for that is 'system'.
+  const source = theme === 'auto' ? 'system' : theme;
+  if (nativeTheme.themeSource !== source) nativeTheme.themeSource = source;
+  return nativeTheme.shouldUseDarkColors;
+}
+
 function applyAppearance() {
   if (!win || win.isDestroyed()) return;
   win.setMinimumSize(cfg.appearance.minWidth || 900, 560);
   win.webContents.setZoomFactor(cfg.uiScale || 1);
+  win.setBackgroundColor(THEME_BG[systemThemeDark() ? 'dark' : 'light']);
   win.webContents.send('app:appearance', { ...cfg.appearance, uiScale: cfg.uiScale });
 }
 
@@ -625,6 +798,7 @@ function appIcon() {
 
 function createWindow() {
   const primary = screen.getPrimaryDisplay();
+  const dark = systemThemeDark();
   win = new BrowserWindow({
     width: cfg.window.width,
     height: cfg.window.height,
@@ -635,7 +809,7 @@ function createWindow() {
     // Without an explicit icon the taskbar falls back to whatever the host exe carries,
     // which for an unpacked app folder is the stock Electron one.
     icon: appIcon(),
-    backgroundColor: cfg.appearance.theme === 'dark' ? '#14171c' : '#f7f8fa',
+    backgroundColor: dark ? THEME_BG.dark : THEME_BG.light,
     show: false,
     autoHideMenuBar: true,
     title: 'JavShelf',
@@ -652,19 +826,10 @@ function createWindow() {
   // 程序以 0 退出：回归跑到一半没有输出、日志停在上一步，看不出是崩了还是被谁关了。
   win.webContents.on('render-process-gone', (_e, d) => {
     log('error', '界面进程退出：' + ((d && d.reason) || '未知') + '（exitCode ' + (d && d.exitCode) + '）');
-    if (SMOKE) {
-      process.stdout.write('SMOKE_FAIL render-process-gone ' + JSON.stringify(d) + '\n');
-      process.exitCode = 1;
-      app.quit();
-    }
   });
   win.webContents.on('unresponsive', () => log('warn', '界面无响应'));
   win.webContents.on('responsive', () => log('info', '界面恢复响应'));
   win.once('ready-to-show', () => {
-    // A hidden/occluded window throttles rAF away, which hangs any smoke step that waits
-    // on scrolling or animation. Keep painting in the background instead of stealing the
-    // screen with an always-on-top test window.
-    if (SMOKE) win.setBackgroundThrottling(false);
     win.show();
   });
   win.loadFile(path.join(ROOT, 'renderer', 'index.html'));
@@ -728,49 +893,6 @@ function restart() {
   quit();
 }
 
-// --smoke-restart: the round trip the tray entry promises. The first process hides a nonce
-// in its own profile and restarts exactly the way the menu does; the second one reads the
-// nonce back and reports its command line and boot state. Results go to a file, not stdout,
-// because a relaunched process is detached and may not inherit the pipe. The env marker is
-// inherited by relaunch, so a relaunch that loops can still only loop once.
-async function restartRoundTrip() {
-  const dir = app.getPath('userData');
-  const probe = path.join(dir, 'restart-probe.json');
-  const result = path.join(dir, 'restart-result.json');
-  if (!process.env.SHELF_RESTART_CHILD) {
-    fs.rmSync(result, { force: true });
-    const nonce = 'r' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
-    fs.writeFileSync(probe, JSON.stringify({ nonce }));
-    process.env.SHELF_RESTART_CHILD = nonce;
-    restart();
-    return;
-  }
-  const want = process.env.SHELF_RESTART_CHILD;
-  let have = '';
-  try {
-    have = String(JSON.parse(fs.readFileSync(probe, 'utf8')).nonce || '');
-  } catch {
-    /* reported as a mismatch below */
-  }
-  let booted = false;
-  for (let i = 0; i < 60 && !booted; i++) {
-    booted = await win.webContents.executeJavaScript('!!window.__booted', true);
-    if (!booted) await new Promise((r) => setTimeout(r, 250));
-  }
-  fs.writeFileSync(
-    result,
-    JSON.stringify({
-      matched: !!have && have === want,
-      booted,
-      userData: dir,
-      libraries: (cfg.libraries || []).length,
-      argv: process.argv.slice(1)
-    })
-  );
-  fs.rmSync(probe, { force: true });
-  quit();
-}
-
 function quit() {
   app.isQuitting = true;
   app.quit();
@@ -810,6 +932,7 @@ function publicConfig() {
     sort: cfg.sort,
     appearance: cfg.appearance,
     playback: cfg.playback,
+    bridge: { ...cfg.bridge, ...bridgePublic() },
     shortcuts: cfg.shortcuts,
     display: cfg.display,
     libraries: libraryList(),
@@ -822,7 +945,9 @@ function publicConfig() {
 ipcMain.handle('app:metrics', () => ({ ...metrics(), config: publicConfig() }));
 ipcMain.handle('app:bootInfo', () => {
   const t0 = Date.now();
-  boot();
+  // whenReady 已经 boot 过；渲染进程重载时数据库句柄与网格都还在，再 boot 一次只会
+  // 重读 6915 行并重建派生索引。只有真的还没 boot 过才在这里补一次。
+  if (!gridCache) boot(STARTUP_SCAN_DELAY);
   const first = activeLibrary();
   return {
     rows: gridCache.rows.length,
@@ -844,6 +969,8 @@ ipcMain.handle('settings:set', (_e, patch) => {
     ...patch,
     appearance: { ...cfg.appearance, ...(patch.appearance || {}) },
     playback: { ...cfg.playback, ...(patch.playback || {}) },
+    // 桥接那项整体覆盖会把端口丢掉：界面只改开关时 patch 里只有 enabled，得逐字段合并。
+    bridge: { ...DEFAULTS.bridge, ...cfg.bridge, ...(patch.bridge || {}) },
     shortcuts: { ...cfg.shortcuts, ...(patch.shortcuts || {}) },
     display: patch.display ? mergeDisplay({ ...cfg.display, ...patch.display }) : cfg.display,
     window: { ...cfg.window, ...(patch.window || {}) }
@@ -853,6 +980,7 @@ ipcMain.handle('settings:set', (_e, patch) => {
   applyAppearance();
   makeTray();
   registerHotkey();
+  applyBridge();
   app.setLoginItemSettings({ openAtLogin: !!next.shortcuts.autostart });
   if (dataChanged) {
     boot();
@@ -920,8 +1048,11 @@ ipcMain.handle('lib:importLegacy', () => {
 });
 
 ipcMain.handle('scan:rescan', () => {
+  // 用户主动要求重扫，就别再等那 8 秒；否则会和马上开始的这一轮撞在一起。
+  for (const t of startupScans.values()) clearTimeout(t);
+  startupScans.clear();
   if (files) files.invalidate();
-  for (const lib of libraryList()) if (lib.enabled !== false) startScan(lib);
+  for (const lib of libraryList()) if (lib.enabled !== false) startScan(lib, 0, true);
   return true;
 });
 
@@ -933,7 +1064,7 @@ ipcMain.handle('ingest:stop', () => {
   return true;
 });
 
-ipcMain.handle('media:resolve', (_e, codes) => resolveEntries(codes));
+ipcMain.handle('media:resolve', (_e, codes, fast) => resolveEntries(codes, { partial: !!fast }));
 
 // Paths this window has been *handed* by a pick dialog. The page cannot read disk through
 // media:readAsData until he has chosen the file himself in the native dialog, which turns a
@@ -1140,9 +1271,13 @@ ipcMain.handle('dupes:detail', async (_e, dirs) => {
   return out;
 });
 
-ipcMain.handle('library:row', (_e, { code, lib }) => {
-  const row = requireDb(lib).loadRow(String(code));
-  if (row) row._media = resolveEntries([String(code)])[String(code)] || null;
+ipcMain.handle('library:row', async (_e, { code, lib }) => {
+  const name = String(lib || libOf.get(String(code)) || '');
+  const row = requireDb(name).loadRow(String(code));
+  if (row) {
+    row._lib = name || [...dbs.keys()][0] || '';
+    row._media = (await resolveEntries([String(code)]))[String(code)] || null;
+  }
   return row;
 });
 ipcMain.handle('library:all', () => gridCache || { cols: [], rows: [] });
@@ -1239,14 +1374,62 @@ async function refreshWarmCopy(abs) {
   }
 }
 
+// Editing an nfo changes metadata the wall shows. Only JavShelf's own shelf tables may be
+// rewritten: a shared legacy database belongs to the old program, and its state columns are
+// the only ones this app is allowed to touch. The exact row is addressed by only_code, because
+// 番号 repeats across folders/libraries; the caller passes the library it opened the row from.
+function syncCachedMeta(name, onlyCode, snap, updatedAt) {
+  if (!gridCache) return;
+  const row = gridCache.rows.find((r) => r._lib === name && String(r.only_code) === String(onlyCode));
+  if (!row) return;
+  for (const [k, v] of Object.entries(snap)) if (k in row) row[k] = v;
+  if ('state_更新' in row) row.state_更新 = updatedAt;
+  try {
+    for (const kind of ['studio', 'series']) entities.rebuild(shelfDbPath(), kind, gridCache.rows);
+  } catch (e) {
+    log('warn', '片商/系列索引未重建：' + (e && e.message));
+  }
+}
+
+function refreshShelfRow(code, libName, onlyCode) {
+  const name = String(libName || libOf.get(String(code)) || cfg.activeLibrary || '');
+  const lib = libraryList().find((l) => l.name === name);
+  if (!lib || lib.store !== 'shelf') return false;
+  const handle = dbs.get(name);
+  if (!handle) return false;
+  const stored = onlyCode ? handle.loadRowByKey(onlyCode) : handle.loadRow(String(code));
+  if (!stored || String(stored.movie_编码) !== String(code)) return false;
+  stored._lib = name;
+  const entry = entryFor(stored, String(code));
+  const abs = nfoPathFor(entry);
+  if (!entry || !abs) return false;
+  let nfo;
+  try {
+    nfo = readNfo(abs, fs.readFileSync(abs, 'utf8'));
+  } catch {
+    return false;
+  }
+  const { rowFromEntry } = require('./ingest');
+  const snap = rowFromEntry(
+    { dir: entry.dir, name: entry.name, video: entry.video || '', size: 0 },
+    nfo
+  );
+  const updatedAt = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const changed = handle.refreshMeta(onlyCode || stored.only_code, snap, updatedAt);
+  if (!changed) return false;
+  syncCachedMeta(name, onlyCode || stored.only_code, snap, updatedAt);
+  return true;
+}
+
 ipcMain.handle('nfo:read', (_e, rel) => readNfoCached(rel));
 // The 演员 box in the nfo editor is part of the document, not decoration: it used to be
 // dropped on the way through this handler, so saving always left the old <actor> list behind.
-ipcMain.handle('nfo:write', async (_e, { rel, fields, actors }) => {
+ipcMain.handle('nfo:write', async (_e, { rel, fields, actors, code, lib, onlyCode }) => {
   const abs = media.resolve(rel);
   const out = writeNfo(abs, { fields, actors: Array.isArray(actors) ? actors : undefined });
   await refreshWarmCopy(abs);
-  return out;
+  const refreshed = out.changed && code ? refreshShelfRow(code, lib, onlyCode) : false;
+  return { ...out, refreshed };
 });
 // Where the overwrite would actually write, in real-path form. Exposed so the regression can
 // assert the invariant that broke once: this must be an absolute path that exists, never an
@@ -1278,9 +1461,22 @@ function guessLegacyIdolDb() {
   return '';
 }
 
-ipcMain.handle('idol:list', () => stampAvatarCovers(idols.list(shelfDbPath())));
+ipcMain.handle('idol:list', () => idols.list(shelfDbPath()));
 ipcMain.handle('idol:save', (_e, idol) => idols.save(shelfDbPath(), idol));
-ipcMain.handle('idol:merge', (_e, { from, into }) => idols.merge(shelfDbPath(), from, into));
+ipcMain.handle('idol:merge', (_e, { from, into }) => {
+  const res = idols.merge(shelfDbPath(), from, into);
+  // Her picture follows the profile: the deleted spelling is often the one that has an
+  // avatar, and a merge that leaves the survivor blank reads as「合并没生效」.
+  if (actors && !actors.has(res.into) && actors.has(res.from)) {
+    try {
+      actors.save(res.into, fs.readFileSync(actors.pathOf(res.from)));
+      res.avatar = res.into;
+    } catch {
+      /* a broken avatar file must not fail the merge itself */
+    }
+  }
+  return res;
+});
 ipcMain.handle('idol:import', (_e, source) => idols.importFrom(shelfDbPath(), String(source || '') || guessLegacyIdolDb()));
 ipcMain.handle('idol:guess', () => guessLegacyIdolDb());
 ipcMain.handle('idol:patch', (_e, { name, fields }) => idols.patch(shelfDbPath(), name, fields || {}));
@@ -1997,15 +2193,15 @@ function actorNames() {
   return [...set].sort((a, b) => a.localeCompare(b, 'ja'));
 }
 
-ipcMain.handle('player:open', async (_e, arg) => {
-  const code = String(typeof arg === 'string' ? arg : (arg && arg.code) || '');
-  const lib = (typeof arg === 'object' && arg && arg.lib) || libOf.get(code) || '';
+// 播放一个人那一条：界面的「播放」按钮与浏览器拓展都走这里，路径解析只此一份
+// （v1.6.6 的教训：播放与海报必须共用 entryFor，否则多库场景一个能播一个不能）。
+async function playByCode(code, libName) {
+  // 指名了库就用它；没指名才按番号回落到它所在的库，最后才是当前库。
+  const lib = String(libName || libOf.get(code) || cfg.activeLibrary || '');
   const handle = requireDb(lib || undefined);
   const row = handle.loadRow(code);
   if (!row) return { ok: false, error: '记录不存在' };
-  // Same resolution the wall uses, stored-folder fallback included: asking only the scan index
-  // made 播放 fail for any library whose root wasn't indexed, while 打开目录 kept working.
-  const hit = entryFor({ ...row, _lib: lib || String(cfg.activeLibrary || '') }, code);
+  const hit = entryFor({ ...row, _lib: lib }, code);
   const video = hit && hit.video;
   if (!video || !(await fsp.stat(video).catch(() => null))) {
     return { ok: false, error: '在库文件夹里找不到这个文件，可能还没扫描完或已被移动' };
@@ -2042,6 +2238,103 @@ ipcMain.handle('player:open', async (_e, arg) => {
   }
   const info = cfg.playback.statFile ? await fsp.stat(hit.video) : null;
   return { ok: true, player, file: hit.video, dir: hit.dir, size: info ? info.size : 0 };
+}
+
+ipcMain.handle('player:open', async (_e, arg) => {
+  const code = String(typeof arg === 'string' ? arg : (arg && arg.code) || '');
+  const lib = (typeof arg === 'object' && arg && arg.lib) || '';
+  return playByCode(code, lib);
+});
+
+// ------------------------------------------------------- 浏览器拓展的本地桥接
+
+// 网站上读到的番号 -> 本地有没有。先按字面比，不中再走与「查重」同一套归一
+// （ABP-123 / abp123 / ABP-0123 同号；ABP-123-2、ABP-123A 是另一部）。
+// 索引每次现建：4300 行扫一遍是毫秒级，而按对象身份缓存会在「改编码不增减行数」时留下旧答案。
+function bridgeLookup(codes) {
+  const rows = gridCache ? gridCache.rows : [];
+  const byRaw = new Map();
+  const byKey = new Map();
+  for (const r of rows) {
+    const raw = String(r.movie_编码 || '').trim();
+    if (!raw) continue;
+    if (!byRaw.has(raw)) byRaw.set(raw, []);
+    byRaw.get(raw).push(r);
+    const k = normalizeKey(raw);
+    if (k) {
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(r);
+    }
+  }
+  const shape = (list, asked) => {
+    const hit = list[0];
+    // 回答里不带片名、路径与磁盘位置：扩展只需要「有没有 / 哪个库 / 看没看过」。
+    return {
+      have: true,
+      asked,
+      code: String(hit.movie_编码 || '').trim(),
+      lib: hit._lib || '',
+      copies: list.length,
+      seen: String(hit.state_已看 || '') === '真',
+      fav: String(hit.state_收藏 || '') === '真'
+    };
+  };
+  const out = {};
+  for (const asked of codes) {
+    const raw = byRaw.get(asked);
+    if (raw) {
+      out[asked] = shape(raw, asked);
+      continue;
+    }
+    const near = byKey.get(normalizeKey(asked));
+    out[asked] = near ? shape(near, asked) : { have: false, asked };
+  }
+  return out;
+}
+
+function bridgeInfo() {
+  return {
+    app: 'JavShelf',
+    version: app.getVersion(),
+    rows: gridCache ? gridCache.rows.length : 0,
+    libraries: libraryList().filter((l) => l.enabled !== false).map((l) => l.name)
+  };
+}
+
+// 关着（或还没起过）的时候 status().port 是 0 —— 那是「没绑定过」的意思，不是用户填的端口。
+// 直接铺开会把设置里的端口框写成 0，再保存一次就把好端口覆盖成 0 了；起不来时也要保留原因。
+function bridgePublic() {
+  const want = Number(cfg.bridge.port) || 0;
+  if (!bridge) return { running: false, port: want, error: '' };
+  const st = bridge.status();
+  return st.running ? st : { ...st, port: want };
+}
+
+// 设置里开了就起、关了或换了端口就跟着走；起不来只写一行日志，界面靠 bridge:status 显示原因。
+async function applyBridge() {
+  if (!bridge) bridge = new Bridge({ lookup: bridgeLookup, play: playByCode, info: bridgeInfo, log });
+  const want = !!(cfg.bridge && cfg.bridge.enabled);
+  const port = Number((cfg.bridge && cfg.bridge.port) || 0);
+  if (!want) {
+    if (bridge.status().running) {
+      bridge.stop();
+      log('info', '浏览器桥接已停止');
+    }
+    return;
+  }
+  if (bridge.status().running && bridge.port === port) return;
+  const err = await bridge.start(port);
+  if (err) log('warn', '浏览器桥接启动失败：' + err);
+  else log('info', `浏览器桥接已启动 127.0.0.1:${bridge.port}`);
+}
+
+ipcMain.handle('bridge:status', () => publicConfig().bridge);
+// 打开拓展所在文件夹，让「加载已解压的扩展程序」有地方可指。路径由主进程自己算，界面给不了。
+ipcMain.handle('bridge:openExtension', async () => {
+  const dir = path.join(ROOT, 'extension');
+  if (!fs.existsSync(dir)) return { ok: false, error: '这个包/源码里没有 extension 目录' };
+  const err = await shell.openPath(dir);
+  return err ? { ok: false, error: err } : { ok: true, dir };
 });
 
 // 打开所在文件夹 / 打开文件: only for paths that are inside a library root, our own data
@@ -2066,11 +2359,25 @@ ipcMain.handle('reveal:file', async (_e, p) => {
 
 // ---------------------------------------------------------------- lifecycle
 
+if (instanceLock) {
+  app.on('second-instance', () => {
+    if (!win || win.isDestroyed()) return;
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  });
+}
+
 app.whenReady().then(() => {
+  // 第二个实例只负责把已有窗口叫回来，绝不 boot、不建窗、不扫描。
+  if (!instanceLock) return;
   if (process.platform === 'win32') app.setAppUserModelId('com.javshelf.library');
   registerImageProtocol();
-  boot();
+  boot(STARTUP_SCAN_DELAY);
   createWindow();
+  nativeTheme.on('updated', () => {
+    if ((cfg.appearance.theme || 'dark') === 'auto') applyAppearance();
+  });
   // Renderer errors land in the same trail as main-process ones, so the 日志 button shows
   // the whole picture instead of only half of it.
   win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
@@ -2078,46 +2385,7 @@ app.whenReady().then(() => {
   });
   makeTray();
   registerHotkey();
-  if (SMOKE_RESTART) {
-    win.webContents.once('did-finish-load', () => {
-      setTimeout(() => {
-        restartRoundTrip().catch((e) => {
-          process.stdout.write('SMOKE_FAIL restart-roundtrip ' + (e && e.stack) + '\n');
-          process.exitCode = 1;
-          quit();
-        });
-      }, 2500);
-    });
-  }
-  if (SMOKE || SMOKE_CRAWL) {
-    win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
-      process.stdout.write(`RENDERER[${level}] ${sourceId}:${line} ${message}\n`);
-    });
-    win.webContents.once('did-finish-load', () => {
-      setTimeout(async () => {
-        // Boot now awaits the avatar inbox, so give it room instead of a fixed guess.
-        for (let i = 0; i < 60; i++) {
-          const ready = await win.webContents.executeJavaScript('!!window.__booted', true);
-          if (ready) break;
-          await new Promise((r) => setTimeout(r, 250));
-        }
-        const { runSmoke, runReopen, runCrawlCheck } = require('./smoke');
-        try {
-          const res = SMOKE_CRAWL
-            ? await runCrawlCheck(win, path.join(ROOT, 'out'))
-            : SMOKE_REOPEN
-                ? await runReopen(win, path.join(ROOT, 'out'))
-                : await runSmoke(win, path.join(ROOT, 'out'), { trayTemplate });
-          process.stdout.write('SMOKE ' + JSON.stringify(res) + '\n');
-        } catch (e) {
-          // A failed run must not look like a clean exit to whoever scripted it.
-          process.stdout.write('SMOKE_FAIL ' + (e && e.stack) + '\n');
-          process.exitCode = 1;
-        }
-        quit();
-      }, 2500);
-    });
-  }
+  applyBridge();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -2126,7 +2394,10 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (!cfg.shortcuts.tray || app.isQuitting) app.quit();
 });
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   app.isQuitting = true;
 });
-app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
+  if (bridge) bridge.stop();
+});

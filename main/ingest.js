@@ -240,4 +240,4 @@ class Ingestor {
   }
 }
 
-module.exports = { Ingestor, COLS };
+module.exports = { Ingestor, COLS, rowFromEntry };

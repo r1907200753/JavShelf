@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "JavShelf 本地库标记",
+  "version": "1.8.0",
+  "description": "在 javdb / javbus 上标出本地库里有没有这部片，点标记直接调用本地播放器。配合 JavShelf 的「本地桥接」使用。",
+  "permissions": ["storage", "scripting"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://javdb.com/*", "*://*.javdb.com/*", "*://javbus.com/*", "*://*.javbus.com/*"],
+      "js": ["content/extract.js", "content/content.js"],
+      "css": ["content/content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "JavShelf 本地库标记"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

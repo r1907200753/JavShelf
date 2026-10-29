@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>JavShelf 本地库标记 · 选项</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 28px 32px; background: #12151b; color: #d7dce5;
+    font: 14px/1.7 system-ui, "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h1 span { color: #4da3ff; }
+  h2 { font-size: 14px; margin: 26px 0 8px; color: #8b93a1; font-weight: 600; }
+  .hint { color: #8b93a1; font-size: 12.5px; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  label.inline { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+  input[type="number"], textarea {
+    background: #1b1f27; border: 1px solid #2c323d; border-radius: 6px; color: #d7dce5;
+    padding: 6px 8px; font: inherit;
+  }
+  input[type="number"] { width: 110px; }
+  textarea { width: 100%; min-height: 84px; resize: vertical; box-sizing: border-box; font-family: Consolas, monospace; font-size: 13px; }
+  button {
+    background: #1b1f27; border: 1px solid #2c323d; border-radius: 6px; color: #d7dce5;
+    padding: 7px 14px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #4da3ff; }
+  button.primary { background: #1d4f8a; border-color: #2f6fb2; }
+  #status { margin-left: 4px; font-size: 13px; }
+  .ok { color: #3fb950; }
+  .bad { color: #f85149; }
+  .warn { color: #d29922; }
+  .card { background: #171b22; border: 1px solid #232933; border-radius: 8px; padding: 14px 16px; margin-top: 10px; }
+  code { background: #1b1f27; border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+  <h1>Jav<span>Shelf</span> 本地库标记</h1>
+  <div class="hint">在 javdb / javbus 的影片页与列表页标出本地库里有没有，点标记直接调用本地播放器。</div>
+
+  <h2>连接</h2>
+  <div class="card">
+    <div class="row">
+      <label class="inline">桥接端口
+        <input id="port" type="number" min="1" max="65535" step="1" />
+      </label>
+      <button id="test">测试连接</button>
+      <span id="status" class="hint">…</span>
+    </div>
+    <div class="hint">
+      JavShelf 里：「设置 → 浏览器拓展」勾上「打开本地桥接」并保存，端口要和这里一致（默认 45789）。<br />
+      桥接只监听本机 127.0.0.1，并只回答带扩展专用请求头的请求；JavShelf 没开或桥接关着时，页面上的标记会显示「JavShelf 未连接」。
+    </div>
+  </div>
+
+  <h2>标记</h2>
+  <div class="card">
+    <div class="row"><label class="inline"><input id="detailMark" type="checkbox" /> 影片页显示状态条（本地已有 / 本地没有，可点击播放）</label></div>
+    <div class="row"><label class="inline"><input id="listMark" type="checkbox" /> 列表页给已入库的卡片加「本地」角标</label></div>
+    <div class="row"><label class="inline"><input id="badgePlay" type="checkbox" /> 角标可点击直接播放</label></div>
+  </div>
+
+  <h2>附加域名（javdb 镜像等）</h2>
+  <div class="card">
+    <textarea id="domains" spellcheck="false" placeholder="每行一个域名，例如：&#10;javdb123.com&#10;www.javbus2.com"></textarea>
+    <div class="hint" style="margin-top:8px">
+      默认已支持 javdb.com 与 javbus.com。镜像站在这里填域名（不含 http:// 与路径），保存时会弹出一次授权，同意后这些站点也会被标记（已经开着的页面刷新一次才生效）。
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:22px">
+    <button id="save" class="primary">保存</button>
+    <span id="saved" class="hint"></span>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

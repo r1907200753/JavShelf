@@ -5,7 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 // ------------------------------------------------------------------ 图片本地缓存 (v1.6)
-// 网盘挂载盘(他的 X:)上读一张海报实测 ~2.4 s、列一次目录 ~0.9 s,而 stat 只要 ~0 ms。
+// 慢盘读取图片的成本可能远高于读取文件元数据，因此使用 size/mtime 决定是否更新缓存。
 // v1.5.5 的做法是「读得慢(≥250 ms)才留一份」+「扫描结束整目录作废」——后者正是卡的原因:
 // 每次库刷新都把网盘海报全部打回原形,海报墙每页 24 张重新逐张走网络。
 // v1.6 改为:
@@ -72,11 +72,19 @@ class ImgCache {
   }
 
   // Protocol-level lookup: existence of the file alone is the hit test (no remote stat).
-  hit(abs) {
-    const st = fs.statSync(this.pathFor(abs), { throwIfNoEntry: false });
-    if (!st || !st.isFile()) return null;
+  // Must stay async: the wall asks for a screenful of images at once, and a synchronous
+  // readFileSync per picture froze the main process for ~1.1 s per 120 cards.
+  async hit(abs) {
+    const key = path.resolve(abs);
+    let buf;
+    try {
+      buf = await fsp.readFile(this.pathFor(key));
+    } catch {
+      return null;
+    }
     this.hits++;
-    return { buf: fs.readFileSync(this.pathFor(abs)), mtime: st.mtimeMs };
+    const meta = this.meta.get(key);
+    return { buf, mtime: (meta && meta.m) || 0 };
   }
 
   write(abs, buf, st) {
@@ -86,6 +94,19 @@ class ImgCache {
     const tmp = f + '.' + process.pid + '.tmp';
     fs.writeFileSync(tmp, buf);
     fs.renameSync(tmp, f);
+    this.meta.set(key, { s: buf.length, m: Math.round(st ? st.mtimeMs : Date.now()) });
+    this.stored++;
+    this.scheduleSave();
+  }
+
+  // 批量预热专用：上千张图逐个 writeFileSync 同样会卡住主进程，写入也让出事件循环。
+  async writeAsync(abs, buf, st) {
+    const key = path.resolve(abs);
+    const f = this.pathFor(key);
+    await fsp.mkdir(path.dirname(f), { recursive: true });
+    const tmp = f + '.' + process.pid + '.tmp';
+    await fsp.writeFile(tmp, buf);
+    await fsp.rename(tmp, f);
     this.meta.set(key, { s: buf.length, m: Math.round(st ? st.mtimeMs : Date.now()) });
     this.stored++;
     this.scheduleSave();
@@ -178,13 +199,21 @@ class ImgCache {
     };
     // 探测:一次快读就足以说明这是本地盘(取均值会被冷启动的慢样本污染,把整个本地库
     // 复制成双份)。没变的探测文件只记跳过,不再重复落盘。
+    // 仅抽样少量异步 stat，避免慢盘上的大量同步元数据访问阻塞主进程。
     const probes = [];
-    if (probeMs !== 0) {
+    if (probeMs > 0) {
+      const candidates = list.filter((p) => IMG_EXT_FOR_PROBE.test(p));
+      const picks = [];
+      const step = Math.max(1, Math.floor(candidates.length / 6));
+      for (let i = 0; i < candidates.length && picks.length < 6; i += step) picks.push(candidates[i]);
       const sized = [];
-      for (const p of list) {
-        if (!IMG_EXT_FOR_PROBE.test(p)) continue;
-        const st0 = fs.statSync(p, { throwIfNoEntry: false });
-        if (st0 && st0.isFile()) sized.push({ p, size: st0.size });
+      for (const p of picks) {
+        try {
+          const st = await fsp.stat(p);
+          if (st.isFile()) sized.push({ p, size: st.size });
+        } catch {
+          /* candidate vanished between scan and warm */
+        }
       }
       sized.sort((a, b) => b.size - a.size);
       probes.push(...sized.slice(0, 2));
@@ -207,10 +236,10 @@ class ImgCache {
         break;
       }
       res.probeMs = Math.max(res.probeMs, Math.round(ms));
-      const st = fs.statSync(p, { throwIfNoEntry: false });
+      const st = await fsp.stat(p).catch(() => null);
       if (this.fresh(p, st)) res.skipped++;
       else if (buf) {
-        this.write(p, buf, st);
+        await this.writeAsync(p, buf, st);
         res.copied++;
       }
     }
@@ -239,13 +268,21 @@ class ImgCache {
             }
             return;
           }
-          if (this.fresh(abs, st) && fs.existsSync(this.pathFor(abs))) {
-            res.skipped++;
-            return;
+          if (this.fresh(abs, st)) {
+            let cached = false;
+            try {
+              cached = (await fsp.stat(this.pathFor(abs))).isFile();
+            } catch {
+              /* manifest says fresh but the copy is gone; re-read it */
+            }
+            if (cached) {
+              res.skipped++;
+              return;
+            }
           }
           try {
             const buf = await fsp.readFile(abs);
-            this.write(abs, buf, st);
+            await this.writeAsync(abs, buf, st);
             res.copied++;
           } catch {
             /* drive hiccup: the lazy protocol path still covers this file */

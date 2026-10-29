@@ -1,0 +1,85 @@
+/* JavShelf 本地库标记 —— 站点样式不可控，这里的关键属性都写死并带 !important */
+
+.jse-pill {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  margin: 6px 0 6px 2px !important;
+  padding: 3px 12px !important;
+  border: 1px solid #6b7280 !important;
+  border-radius: 999px !important;
+  background: rgba(0, 0, 0, 0.35) !important;
+  color: #d1d5db !important;
+  font: 13px/1.6 system-ui, "Microsoft YaHei", sans-serif !important;
+  vertical-align: middle !important;
+  user-select: none !important;
+}
+.jse-pill .jse-dot {
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 50% !important;
+  background: currentColor !important;
+  flex: none !important;
+}
+.jse-pill .jse-main {
+  color: inherit !important;
+  font: inherit !important;
+}
+.jse-pill .jse-sub {
+  color: inherit !important;
+  opacity: 0.75 !important;
+  font-size: 12px !important;
+}
+.jse-pill.jse-checking {
+  color: #9ca3af !important;
+}
+.jse-pill.jse-have {
+  border-color: #2ea043 !important;
+  color: #3fb950 !important;
+  cursor: pointer !important;
+}
+.jse-pill.jse-have:hover {
+  background: rgba(46, 160, 67, 0.18) !important;
+}
+.jse-pill.jse-missing {
+  color: #8b949e !important;
+}
+.jse-pill.jse-ok {
+  border-color: #2ea043 !important;
+  background: rgba(46, 160, 67, 0.9) !important;
+  color: #fff !important;
+}
+.jse-pill.jse-offline {
+  border-color: #d29922 !important;
+  color: #d29922 !important;
+  cursor: help !important;
+}
+.jse-pill.jse-fail {
+  border-color: #f85149 !important;
+  color: #f85149 !important;
+  cursor: pointer !important;
+}
+
+.jse-host {
+  position: relative !important;
+}
+.jse-badge {
+  position: absolute !important;
+  right: 4px !important;
+  bottom: 4px !important;
+  z-index: 5 !important;
+  padding: 1px 6px !important;
+  border-radius: 4px !important;
+  background: rgba(46, 160, 67, 0.92) !important;
+  color: #fff !important;
+  font: 11px/1.7 system-ui, "Microsoft YaHei", sans-serif !important;
+  letter-spacing: 0.5px !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4) !important;
+  user-select: none !important;
+}
+.jse-badge.jse-clickable {
+  cursor: pointer !important;
+}
+.jse-badge.jse-clickable:hover {
+  background: #3fb950 !important;
+}
