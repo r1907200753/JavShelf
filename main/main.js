@@ -1391,7 +1391,19 @@ function syncCachedMeta(name, onlyCode, snap, updatedAt) {
   }
 }
 
-function refreshShelfRow(code, libName, onlyCode) {
+// 刚写过的那份 nfo 优先从缓存副本读：写盘侧已经刷过一遍,挂载盘上再读一次是白花 250 ms。
+async function readNfoAfterWrite(abs) {
+  const st = await fsp.stat(abs).catch(() => null);
+  if (st && imgCache.fresh(abs, st)) {
+    const buf = imgCache.bytes(abs);
+    if (buf) return readNfo(abs, buf.toString('utf8'));
+  }
+  return readNfo(abs, await fsp.readFile(abs, 'utf8'));
+}
+
+// absNfo is for callers that just wrote the file — the sidecar index may not have seen it yet
+// (a freshly created nfo), and the caller already knows the exact path.
+async function refreshShelfRow(code, libName, onlyCode, absNfo) {
   const name = String(libName || libOf.get(String(code)) || cfg.activeLibrary || '');
   const lib = libraryList().find((l) => l.name === name);
   if (!lib || lib.store !== 'shelf') return false;
@@ -1401,11 +1413,11 @@ function refreshShelfRow(code, libName, onlyCode) {
   if (!stored || String(stored.movie_编码) !== String(code)) return false;
   stored._lib = name;
   const entry = entryFor(stored, String(code));
-  const abs = nfoPathFor(entry);
+  const abs = absNfo || nfoPathFor(entry);
   if (!entry || !abs) return false;
   let nfo;
   try {
-    nfo = readNfo(abs, fs.readFileSync(abs, 'utf8'));
+    nfo = await readNfoAfterWrite(abs);
   } catch {
     return false;
   }
@@ -1428,7 +1440,7 @@ ipcMain.handle('nfo:write', async (_e, { rel, fields, actors, code, lib, onlyCod
   const abs = media.resolve(rel);
   const out = writeNfo(abs, { fields, actors: Array.isArray(actors) ? actors : undefined });
   await refreshWarmCopy(abs);
-  const refreshed = out.changed && code ? refreshShelfRow(code, lib, onlyCode) : false;
+  const refreshed = out.changed && code ? await refreshShelfRow(code, lib, onlyCode) : false;
   return { ...out, refreshed };
 });
 // Where the overwrite would actually write, in real-path form. Exposed so the regression can
@@ -1904,13 +1916,15 @@ async function applyJavdbNfo(code) {
   const payload = { fields, actors: (female.length ? female : info.actors.map((a) => a.name)).map((n) => ({ name: n, role: '' })) };
   const written = creating ? createNfo(nfo, payload) : writeNfo(nfo, payload);
   await refreshWarmCopy(nfo);
-  let refreshed = null;
+  // 覆写只动了这一个条目的 nfo。以前这里跑一次「删改刷新」来更新索引，代价是把整棵库重新走
+  // 一遍——挂载盘上点一次要等几分钟。现在用刚写的这份 nfo 只重算这一行（和 nfo 编辑保存同一条路）。
+  let refreshed = false;
   try {
-    refreshed = await runIngest(row._lib || cfg.activeLibrary, 'delta');
+    refreshed = await refreshShelfRow(code, row._lib || cfg.activeLibrary, row.only_code, nfo);
   } catch (e) {
-    // The nfo is already correct, so a failed re-scan must not look like a failed write —
+    // The nfo is already correct, so a failed refresh must not look like a failed write —
     // but it does have to be said, or the wall keeps showing the old 片名 with no trace.
-    log('warn', `覆写后重扫未成功（${code}）：${(e && e.message) || e}`);
+    log('warn', `覆写后刷新索引未成功（${code}）：${(e && e.message) || e}`);
   }
   return { info, written, refreshed, actresses: female };
 }

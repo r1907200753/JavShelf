@@ -1,6 +1,6 @@
 {
   "name": "javshelf",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "JavShelf: 高分屏、本地多库、演员头像、流畅度优先的媒体库管理器",
   "main": "main/main.js",
   "private": true,

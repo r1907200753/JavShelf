@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/hero.svg" width="100%" alt="JavShelf — 让本地收藏，井然有序。Orbit v2.0.1" />
+  <img src="assets/hero.svg" width="100%" alt="JavShelf — 让本地收藏，井然有序。Orbit v2.0.2" />
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 
 ## 你的媒体库，从这里开始
 
-![JavShelf v2.0.1 实际初始界面：未添加媒体库的空白状态](assets/screenshot-empty.png)
+![JavShelf v2.0.2 实际初始界面：未添加媒体库的空白状态](assets/screenshot-empty.png)
 
 <p align="center"><sub>真实软件截图 · 全新空库 · 无示例影片、媒体封面或个人数据</sub></p>
 
@@ -42,7 +42,7 @@
 
 ## 三步开始
 
-1. **下载并解压**：在 [最新发布](https://github.com/r1907200753/JavShelf/releases/latest) 下载 `JavShelf-v2.0.1-windows-x86_64.zip`，完整解压到可写目录，再运行 `JavShelf.exe`。无需安装 Node.js。
+1. **下载并解压**：在 [最新发布](https://github.com/r1907200753/JavShelf/releases/latest) 下载 `JavShelf-v2.0.2-windows-x86_64.zip`，完整解压到可写目录，再运行 `JavShelf.exe`。无需安装 Node.js。
 2. **添加媒体库**：打开「管理媒体库」，选择自己的影片目录。已有的 `.nfo` 与 `-poster / -fanart / -thumb.jpg` 可直接用于建立海报墙。
 3. **开始浏览**：单击海报看详情，使用「播放」调用系统默认播放器；也可以在设置中指定播放器。
 
